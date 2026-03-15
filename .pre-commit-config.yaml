@@ -1,0 +1,26 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml          # valid YAML syntax
+      - id: check-json          # valid JSON syntax (.secrets.baseline)
+      - id: trailing-whitespace # no trailing spaces
+      - id: end-of-file-fixer   # files end with a newline
+      - id: check-merge-conflict # no unresolved merge markers
+      - id: check-added-large-files # block accidental large file commits
+        args: ['--maxkb=500']
+      - id: mixed-line-ending   # consistent line endings
+        args: ['--fix=lf']
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: ['-d', '{extends: default, rules: {line-length: {max: 120}}}']
+        files: \.github/workflows/.*\.yml$
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline', '--exclude-files', '\.secrets\.baseline']

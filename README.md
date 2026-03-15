@@ -26,6 +26,30 @@ Infrastructure automation for a zero-cost production stack. All workflows run on
 
 ---
 
+## Local setup
+
+Requires Python 3.11+ and `make`.
+
+```bash
+make setup
+```
+
+This creates a virtualenv, installs all dependencies, and installs the pre-commit hook that runs `detect-secrets` before every commit.
+
+### Available commands
+
+| Command | Description |
+|---------|-------------|
+| `make setup` | Create venv, install deps, install pre-commit hook |
+| `make lint` | Validate workflow YAML syntax |
+| `make scan` | Run secret scan manually against the current baseline |
+| `make baseline` | Regenerate `.secrets.baseline` (after false positives) |
+| `make audit` | Interactively mark false positives in the baseline |
+| `make clean` | Remove the virtual environment |
+| `make` | Show all commands with descriptions |
+
+---
+
 ## Secrets configuration
 
 Go to **Settings → Secrets and variables → Actions → New repository secret**.
@@ -139,17 +163,14 @@ This repo is **public** to get unlimited GitHub Actions minutes. Secrets are pro
 
 ### Handling false positives in secret-scan
 
-If `detect-secrets` flags something that is not actually a secret (e.g., a high-entropy string in a README example):
+If `detect-secrets` flags something that is not actually a secret:
 
 ```bash
-# Install locally
-pip install detect-secrets
+# Regenerate the baseline
+make baseline
 
-# Regenerate the baseline (scans all files)
-detect-secrets scan > .secrets.baseline
-
-# Interactively audit — press 'n' for "not a secret", 'y' to confirm it's real
-detect-secrets audit .secrets.baseline
+# Interactively mark false positives (press 'n' = not a secret)
+make audit
 
 # Commit the updated baseline
 git add .secrets.baseline
