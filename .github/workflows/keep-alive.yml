@@ -1,0 +1,157 @@
+name: Keep Alive + Auto Recovery
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:         # manual trigger for testing
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: true
+
+jobs:
+  health-check:
+    name: Health Check & Auto Recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check API + Redis health (with retries)
+        id: api_check
+        env:
+          API_HEALTH_URL: ${{ secrets.API_HEALTH_URL }}
+        run: |
+          MAX_RETRIES=3
+          RETRY_DELAY=10
+          attempt=0
+          api_ok=false
+          redis_ok=false
+          http_status=""
+          response_body=""
+
+          while [ $attempt -lt $MAX_RETRIES ]; do
+            attempt=$((attempt + 1))
+            echo "Attempt $attempt/$MAX_RETRIES — GET $API_HEALTH_URL"
+
+            http_status=$(curl -s -o /tmp/health_response.json \
+              -w "%{http_code}" \
+              --max-time 15 \
+              "$API_HEALTH_URL" || echo "000")
+
+            echo "HTTP status: $http_status"
+
+            if [ "$http_status" = "200" ]; then
+              response_body=$(cat /tmp/health_response.json)
+              echo "Response: $response_body"
+
+              # Check if redis field is true in the JSON response
+              redis_status=$(echo "$response_body" | python3 -c \
+                "import sys, json; d=json.load(sys.stdin); print(str(d.get('redis', False)).lower())" 2>/dev/null || echo "false")
+
+              if [ "$redis_status" = "true" ]; then
+                redis_ok=true
+              fi
+
+              api_ok=true
+              break
+            fi
+
+            if [ $attempt -lt $MAX_RETRIES ]; then
+              echo "Retrying in ${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
+            fi
+          done
+
+          echo "api_ok=$api_ok"   >> "$GITHUB_OUTPUT"
+          echo "redis_ok=$redis_ok" >> "$GITHUB_OUTPUT"
+          echo "http_status=$http_status" >> "$GITHUB_OUTPUT"
+
+      - name: Check Frontend (optional)
+        id: frontend_check
+        if: ${{ secrets.FRONTEND_URL != '' }}
+        env:
+          FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+        run: |
+          if [ -z "$FRONTEND_URL" ]; then
+            echo "FRONTEND_URL not configured — skipping"
+            echo "frontend_ok=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Checking frontend: $FRONTEND_URL"
+          http_status=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 15 \
+            "$FRONTEND_URL" || echo "000")
+
+          echo "Frontend HTTP status: $http_status"
+
+          if [ "$http_status" = "200" ] || [ "$http_status" = "301" ] || [ "$http_status" = "302" ]; then
+            echo "frontend_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "frontend_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "frontend_http_status=$http_status" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Render redeploy (API down)
+        if: steps.api_check.outputs.api_ok == 'false'
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          echo "API did not respond after 3 retries. Triggering Render redeploy..."
+          deploy_response=$(curl -s -o /tmp/deploy_response.txt -w "%{http_code}" \
+            -X POST "$RENDER_DEPLOY_HOOK_URL")
+          echo "Deploy hook HTTP status: $deploy_response"
+          cat /tmp/deploy_response.txt || true
+
+      - name: Notify Discord
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          API_OK: ${{ steps.api_check.outputs.api_ok }}
+          REDIS_OK: ${{ steps.api_check.outputs.redis_ok }}
+          HTTP_STATUS: ${{ steps.api_check.outputs.http_status }}
+          FRONTEND_OK: ${{ steps.frontend_check.outputs.frontend_ok }}
+          FRONTEND_HTTP_STATUS: ${{ steps.frontend_check.outputs.frontend_http_status }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL not configured — skipping notification"
+            exit 0
+          fi
+
+          # Only notify on failures to avoid spam
+          issues=()
+
+          if [ "$API_OK" = "false" ]; then
+            issues+=("**API** — no respondió tras 3 reintentos (último HTTP: ${HTTP_STATUS}). Se disparó redeploy automático.")
+          elif [ "$REDIS_OK" = "false" ]; then
+            issues+=("**Redis** — la API responde (HTTP ${HTTP_STATUS}) pero redis=false en el health check.")
+          fi
+
+          if [ "$FRONTEND_OK" = "false" ]; then
+            issues+=("**Frontend** — no respondió (HTTP: ${FRONTEND_HTTP_STATUS}).")
+          fi
+
+          if [ ${#issues[@]} -eq 0 ]; then
+            echo "All checks passed — no notification needed"
+            exit 0
+          fi
+
+          # Build message
+          msg="🚨 **Health Check Alert** — $(date -u '+%Y-%m-%d %H:%M UTC')\n\n"
+          for issue in "${issues[@]}"; do
+            msg+="• $issue\n"
+          done
+          msg+="\n[Ver run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          payload=$(python3 -c "
+          import json, sys
+          msg = sys.argv[1]
+          print(json.dumps({'content': msg}))
+          " "$msg")
+
+          curl -s -o /dev/null -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+          echo "Discord notification sent"

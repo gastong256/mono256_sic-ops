@@ -1,0 +1,111 @@
+name: Backup Supabase → Cloudflare R2
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 3 AM UTC daily
+  workflow_dispatch:       # manual trigger
+
+jobs:
+  backup:
+    name: pg_dump + upload to R2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install postgresql-client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client
+
+      - name: Dump database
+        env:
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
+          DUMP_FILE="backup_${TIMESTAMP}.dump"
+          echo "DUMP_FILE=$DUMP_FILE" >> "$GITHUB_ENV"
+          echo "TIMESTAMP=$TIMESTAMP" >> "$GITHUB_ENV"
+
+          echo "Running pg_dump..."
+          pg_dump \
+            -h "${{ secrets.SUPABASE_DB_HOST }}" \
+            -U "${{ secrets.SUPABASE_DB_USER }}" \
+            -F c \
+            -f "$DUMP_FILE"
+
+          echo "Dump size: $(du -sh $DUMP_FILE | cut -f1)"
+
+      - name: Compress dump
+        run: |
+          gzip "$DUMP_FILE"
+          COMPRESSED_FILE="${DUMP_FILE}.gz"
+          echo "COMPRESSED_FILE=$COMPRESSED_FILE" >> "$GITHUB_ENV"
+          echo "Compressed size: $(du -sh $COMPRESSED_FILE | cut -f1)"
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp "$COMPRESSED_FILE" \
+            "s3://${{ secrets.R2_BUCKET_NAME }}/$COMPRESSED_FILE" \
+            --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+
+          echo "Upload complete: $COMPRESSED_FILE"
+
+      - name: Prune backups older than 7 days
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          CUTOFF=$(date -u -d '7 days ago' '+%Y%m%d')
+          echo "Pruning backups older than $CUTOFF..."
+
+          # List all backup objects
+          aws s3 ls "s3://${{ secrets.R2_BUCKET_NAME }}/" \
+            --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+            | awk '{print $4}' \
+            | grep -E '^backup_[0-9]{8}_[0-9]{6}\.dump\.gz$' \
+            > /tmp/all_backups.txt
+
+          echo "Total backups found: $(wc -l < /tmp/all_backups.txt)"
+
+          deleted=0
+          while IFS= read -r filename; do
+            # Extract date portion: backup_YYYYMMDD_HHMMSS.dump.gz → YYYYMMDD
+            file_date=$(echo "$filename" | sed -E 's/backup_([0-9]{8})_[0-9]{6}\.dump\.gz/\1/')
+
+            if [ "$file_date" \< "$CUTOFF" ]; then
+              echo "Deleting old backup: $filename (date: $file_date)"
+              aws s3 rm "s3://${{ secrets.R2_BUCKET_NAME }}/$filename" \
+                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              deleted=$((deleted + 1))
+            fi
+          done < /tmp/all_backups.txt
+
+          echo "Pruned $deleted old backup(s)"
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL not configured — skipping notification"
+            exit 0
+          fi
+
+          msg="🚨 **Backup Failed** — $(date -u '+%Y-%m-%d %H:%M UTC')\n\nEl backup diario de Supabase → R2 falló.\n[Ver run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          payload=$(python3 -c "
+          import json, sys
+          msg = sys.argv[1]
+          print(json.dumps({'content': msg}))
+          " "$msg")
+
+          curl -s -o /dev/null -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL" || true
