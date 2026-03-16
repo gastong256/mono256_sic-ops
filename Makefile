@@ -44,36 +44,22 @@ lint: _require_venv ## Validate workflow YAML syntax
 
 .PHONY: scan
 scan: _require_venv ## Run secret scan against current baseline
-	$(DET_SECRETS) scan --exclude-files '\.secrets\.baseline' > /tmp/current_scan.json
-	@python3 - <<'EOF'
-	import sys, json
-	with open("/tmp/current_scan.json") as f:
-	    current = json.load(f)
-	with open("$(BASELINE)") as f:
-	    baseline = json.load(f)
-	baseline_secrets = {
-	    (fp, s["hashed_secret"])
-	    for fp, secrets in baseline.get("results", {}).items()
-	    for s in secrets
-	}
-	new = {}
-	for fp, secrets in current.get("results", {}).items():
-	    for s in secrets:
-	        if (fp, s["hashed_secret"]) not in baseline_secrets:
-	            new.setdefault(fp, []).append(s)
-	if new:
-	    print("NEW SECRETS DETECTED:")
-	    for fp, secrets in new.items():
-	        for s in secrets:
-	            print(f"  File: {fp}  |  Type: {s['type']}  |  Line: {s['line_number']}")
-	    sys.exit(1)
-	else:
-	    print("✓ No new secrets detected.")
-	EOF
+	cp $(BASELINE) /tmp/current_scan.baseline
+	$(DET_SECRETS) scan --all-files --exclude-files '(^|/)\.venv/|(^|/)venv/' --baseline /tmp/current_scan.baseline
+	@$(PYTHON) -c 'import json, sys; \
+current = json.load(open("/tmp/current_scan.baseline")); \
+baseline = json.load(open("$(BASELINE)")); \
+baseline_secrets = {(fp, s["hashed_secret"]) for fp, secrets in baseline.get("results", {}).items() for s in secrets}; \
+new = [(fp, s["type"], s["line_number"]) for fp, secrets in current.get("results", {}).items() for s in secrets if (fp, s["hashed_secret"]) not in baseline_secrets]; \
+print("NEW SECRETS DETECTED:" if new else "✓ No new secrets detected."); \
+[print(f"  File: {fp}  |  Type: {typ}  |  Line: {line}") for fp, typ, line in new]; \
+sys.exit(1 if new else 0)'
 
 .PHONY: baseline
 baseline: _require_venv ## Regenerate .secrets.baseline (run after false positives)
-	$(DET_SECRETS) scan --exclude-files '\.secrets\.baseline' > $(BASELINE)
+	cp $(BASELINE) $(BASELINE).tmp
+	$(DET_SECRETS) scan --all-files --exclude-files '(^|/)\.venv/|(^|/)venv/' --baseline $(BASELINE).tmp
+	mv $(BASELINE).tmp $(BASELINE)
 	@echo "✓ Baseline updated. Review with: make audit"
 	@echo "  Then: git add $(BASELINE) && git commit -m 'chore: update secrets baseline'"
 

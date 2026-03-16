@@ -1,111 +1,267 @@
-name: Backup Supabase → Cloudflare R2
+---
+name: Backup Supabase To R2
 
-on:
+"on":
   schedule:
-    - cron: '0 3 * * *'   # 3 AM UTC daily
-  workflow_dispatch:       # manual trigger
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   backup:
-    name: pg_dump + upload to R2
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      SUPABASE_DB_HOST: ${{ secrets.SUPABASE_DB_HOST }}
+      SUPABASE_DB_USER: ${{ secrets.SUPABASE_DB_USER }}
+      PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
 
     steps:
-      - name: Install postgresql-client
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y postgresql-client
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Dump database
-        env:
-          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      - name: Install PostgreSQL client
+        shell: bash
         run: |
-          TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
-          DUMP_FILE="backup_${TIMESTAMP}.dump"
-          echo "DUMP_FILE=$DUMP_FILE" >> "$GITHUB_ENV"
-          echo "TIMESTAMP=$TIMESTAMP" >> "$GITHUB_ENV"
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
 
-          echo "Running pg_dump..."
+      - name: Create compressed database dump
+        id: dump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timestamp="$(date -u +%Y%m%d_%H%M%S)"
+          dump_file="backup_${timestamp}.dump"
+          archive_file="${dump_file}.gz"
+
+          echo "Creating pg_dump for Supabase..."
           pg_dump \
-            -h "${{ secrets.SUPABASE_DB_HOST }}" \
-            -U "${{ secrets.SUPABASE_DB_USER }}" \
+            -h "$SUPABASE_DB_HOST" \
+            -p 5432 \
+            -U "$SUPABASE_DB_USER" \
+            -d postgres \
+            --no-owner \
+            --no-privileges \
             -F c \
-            -f "$DUMP_FILE"
+            -f "$dump_file"
 
-          echo "Dump size: $(du -sh $DUMP_FILE | cut -f1)"
+          echo "Compressing dump with gzip..."
+          gzip -c "$dump_file" > "$archive_file"
 
-      - name: Compress dump
-        run: |
-          gzip "$DUMP_FILE"
-          COMPRESSED_FILE="${DUMP_FILE}.gz"
-          echo "COMPRESSED_FILE=$COMPRESSED_FILE" >> "$GITHUB_ENV"
-          echo "Compressed size: $(du -sh $COMPRESSED_FILE | cut -f1)"
+          compressed_bytes="$(stat -c%s "$archive_file")"
+          original_bytes="$(gzip -l "$archive_file" | awk 'NR==2 {print $2}')"
 
-      - name: Upload to Cloudflare R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-        run: |
-          aws s3 cp "$COMPRESSED_FILE" \
-            "s3://${{ secrets.R2_BUCKET_NAME }}/$COMPRESSED_FILE" \
-            --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          echo "Dump ready: ${archive_file}"
+          echo "Compressed size: $(numfmt --to=iec "$compressed_bytes")"
+          echo "Estimated original size: $(numfmt --to=iec "$original_bytes")"
 
-          echo "Upload complete: $COMPRESSED_FILE"
-
-      - name: Prune backups older than 7 days
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-        run: |
-          CUTOFF=$(date -u -d '7 days ago' '+%Y%m%d')
-          echo "Pruning backups older than $CUTOFF..."
-
-          # List all backup objects
-          aws s3 ls "s3://${{ secrets.R2_BUCKET_NAME }}/" \
-            --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
-            | awk '{print $4}' \
-            | grep -E '^backup_[0-9]{8}_[0-9]{6}\.dump\.gz$' \
-            > /tmp/all_backups.txt
-
-          echo "Total backups found: $(wc -l < /tmp/all_backups.txt)"
-
-          deleted=0
-          while IFS= read -r filename; do
-            # Extract date portion: backup_YYYYMMDD_HHMMSS.dump.gz → YYYYMMDD
-            file_date=$(echo "$filename" | sed -E 's/backup_([0-9]{8})_[0-9]{6}\.dump\.gz/\1/')
-
-            if [ "$file_date" \< "$CUTOFF" ]; then
-              echo "Deleting old backup: $filename (date: $file_date)"
-              aws s3 rm "s3://${{ secrets.R2_BUCKET_NAME }}/$filename" \
-                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
-              deleted=$((deleted + 1))
-            fi
-          done < /tmp/all_backups.txt
-
-          echo "Pruned $deleted old backup(s)"
-
-      - name: Notify Discord on failure
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-            echo "DISCORD_WEBHOOK_URL not configured — skipping notification"
-            exit 0
+          db_warning="false"
+          if [ "$original_bytes" -gt $((400 * 1024 * 1024)) ]; then
+            db_warning="true"
+            echo "::warning::Estimated database size is above 400 MiB."
           fi
 
-          msg="🚨 **Backup Failed** — $(date -u '+%Y-%m-%d %H:%M UTC')\n\nEl backup diario de Supabase → R2 falló.\n[Ver run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          rm -f "$dump_file"
 
-          payload=$(python3 -c "
-          import json, sys
-          msg = sys.argv[1]
-          print(json.dumps({'content': msg}))
-          " "$msg")
+          echo "archive_file=$archive_file" >> "$GITHUB_OUTPUT"
+          echo "compressed_bytes=$compressed_bytes" >> "$GITHUB_OUTPUT"
+          echo "original_bytes=$original_bytes" >> "$GITHUB_OUTPUT"
+          echo "db_warning=$db_warning" >> "$GITHUB_OUTPUT"
 
-          curl -s -o /dev/null -X POST \
-            -H "Content-Type: application/json" \
-            -d "$payload" \
-            "$DISCORD_WEBHOOK_URL" || true
+      - name: Upload backup to Cloudflare R2
+        id: upload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_file="${{ steps.dump.outputs.archive_file }}"
+          echo "Uploading ${archive_file} to R2 bucket ${R2_BUCKET_NAME}..."
+          aws s3 cp "$archive_file" "s3://${R2_BUCKET_NAME}/${archive_file}" \
+            --endpoint-url "$R2_ENDPOINT"
+
+      - name: Verify backup round-trip integrity
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_file="${{ steps.dump.outputs.archive_file }}"
+          verify_archive="verify_${archive_file}"
+          verify_dump="${verify_archive%.gz}"
+
+          echo "Downloading uploaded backup back from R2..."
+          aws s3 cp "s3://${R2_BUCKET_NAME}/${archive_file}" "$verify_archive" \
+            --endpoint-url "$R2_ENDPOINT"
+
+          echo "Testing gzip integrity and pg_restore manifest listing..."
+          gunzip -c "$verify_archive" > "$verify_dump"
+          pg_restore --list "$verify_dump" > /tmp/pg_restore_manifest.txt
+
+          rm -f "$verify_archive" "$verify_dump"
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
+      - name: Track R2 storage usage
+        id: r2_usage
+        if: ${{ success() || failure() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Calculating bucket usage..."
+          listing="$(aws s3 ls "s3://${R2_BUCKET_NAME}/" --recursive --summarize \
+            --endpoint-url "$R2_ENDPOINT")"
+
+          object_count="$(printf '%s\n' "$listing" | awk '/Total Objects:/ {print $3}')"
+          total_bytes="$(printf '%s\n' "$listing" | awk '/Total Size:/ {print $3}')"
+          object_count="${object_count:-0}"
+          total_bytes="${total_bytes:-0}"
+
+          echo "Backups stored: ${object_count}"
+          echo "Total R2 usage: $(numfmt --to=iec "$total_bytes")"
+
+          storage_warning="false"
+          if [ "$total_bytes" -gt $((8 * 1024 * 1024 * 1024)) ]; then
+            storage_warning="true"
+            echo "::warning::R2 usage is above 8 GiB."
+          fi
+
+          remaining_bytes=$((10 * 1024 * 1024 * 1024 - total_bytes))
+          if [ "$remaining_bytes" -lt 0 ]; then
+            remaining_bytes=0
+          fi
+
+          echo "Available free-tier headroom: $(numfmt --to=iec "$remaining_bytes")"
+
+          echo "object_count=$object_count" >> "$GITHUB_OUTPUT"
+          echo "total_bytes=$total_bytes" >> "$GITHUB_OUTPUT"
+          echo "storage_warning=$storage_warning" >> "$GITHUB_OUTPUT"
+
+      - name: Remove backups older than 7 days
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cutoff="$(date -u -d '7 days ago' +%Y%m%d)"
+          deleted=0
+
+          echo "Removing backups older than ${cutoff}..."
+          while read -r _ _ _ key; do
+            [ -n "${key:-}" ] || continue
+
+            case "$key" in
+              backup_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_*.dump.gz)
+                file_date="${key#backup_}"
+                file_date="${file_date%%_*}"
+                if [ "$file_date" -lt "$cutoff" ]; then
+                  echo "Deleting ${key}"
+                  aws s3 rm "s3://${R2_BUCKET_NAME}/${key}" --endpoint-url "$R2_ENDPOINT"
+                  deleted=$((deleted + 1))
+                fi
+                ;;
+            esac
+          done < <(aws s3 ls "s3://${R2_BUCKET_NAME}/" --recursive --endpoint-url "$R2_ENDPOINT")
+
+          echo "Deleted ${deleted} old backup(s)."
+
+      - name: Notify Discord on failure or warning
+        if: >-
+          ${{
+            always() &&
+            secrets.DISCORD_WEBHOOK_URL != '' &&
+            (
+              failure() ||
+              steps.dump.outputs.db_warning == 'true' ||
+              steps.r2_usage.outputs.storage_warning == 'true'
+            )
+          }}
+        env:
+          ARCHIVE_FILE: ${{ steps.dump.outputs.archive_file }}
+          COMPRESSED_BYTES: ${{ steps.dump.outputs.compressed_bytes }}
+          ORIGINAL_BYTES: ${{ steps.dump.outputs.original_bytes }}
+          DB_WARNING: ${{ steps.dump.outputs.db_warning }}
+          STORAGE_WARNING: ${{ steps.r2_usage.outputs.storage_warning }}
+          OBJECT_COUNT: ${{ steps.r2_usage.outputs.object_count }}
+          TOTAL_BYTES: ${{ steps.r2_usage.outputs.total_bytes }}
+          VERIFY_RESULT: ${{ steps.verify.outcome }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export MESSAGE="$(
+            python3 <<'PY'
+            import os
+
+            def humanize(num: str) -> str:
+                try:
+                    value = int(num)
+                except Exception:
+                    return "unknown"
+                units = ["B", "KiB", "MiB", "GiB", "TiB"]
+                idx = 0
+                size = float(value)
+                while size >= 1024 and idx < len(units) - 1:
+                    size /= 1024
+                    idx += 1
+                return f"{size:.1f} {units[idx]}"
+
+            lines = ["Ops alert from backup workflow:"]
+            archive = os.getenv("ARCHIVE_FILE", "")
+            if archive:
+                lines.append(f"- Backup file: {archive}")
+
+            lines.append(
+                f"- Backup verification step: {os.getenv('VERIFY_RESULT', 'unknown')}."
+            )
+            lines.append(
+                f"- Compressed size: {humanize(os.getenv('COMPRESSED_BYTES', '0'))}; "
+                f"estimated DB size: {humanize(os.getenv('ORIGINAL_BYTES', '0'))}."
+            )
+            lines.append(
+                f"- R2 usage: {humanize(os.getenv('TOTAL_BYTES', '0'))} "
+                f"across {os.getenv('OBJECT_COUNT', '0')} object(s)."
+            )
+
+            if os.getenv("DB_WARNING") == "true":
+                lines.append("- Warning: estimated database size is above 400 MiB.")
+            if os.getenv("STORAGE_WARNING") == "true":
+                lines.append("- Warning: R2 usage is above 8 GiB.")
+
+            repo = os.getenv("REPO", "")
+            run_id = os.getenv("RUN_ID", "")
+            if repo and run_id:
+                lines.append(f"- Run: https://github.com/{repo}/actions/runs/{run_id}")
+
+            print("\n".join(lines))
+            PY
+          )"
+
+          python3 <<'PY' || true
+          import json
+          import os
+          import urllib.request
+
+          payload = json.dumps({"content": os.environ["MESSAGE"]}).encode("utf-8")
+          request = urllib.request.Request(
+              os.environ["DISCORD_WEBHOOK_URL"],
+              data=payload,
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              urllib.request.urlopen(request, timeout=15).read()
+          except Exception as exc:
+              print(f"Discord notification failed: {exc}")
+          PY

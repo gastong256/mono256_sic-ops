@@ -2,16 +2,17 @@
 .env
 .env.*
 !.env.example
+credentials/
 *.pem
 *.key
-credentials/
 
-# Database dumps & backups (never commit locally)
+# Database dumps & backups
 *.dump
 *.dump.gz
 *.sql
+*.sql.gz
 
-# JSON files (except baseline)
+# JSON files except detect-secrets baseline
 *.json
 !.secrets.baseline
 
