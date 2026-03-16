@@ -15,14 +15,15 @@ All credentials live in GitHub Actions secrets. No secrets belong in code.
 | Database | PostgreSQL on Supabase | Free | No automatic backups, 500 MB max, pauses after 7 idle days |
 | Frontend | Vercel | Free | No spin-down needed for CDN delivery |
 | Backups | Cloudflare R2 | Free | 10 GB storage, 1M Class A ops, 10M Class B ops, 0 egress |
+| Keep-alive trigger | Cloudflare Workers Cron | Free | Used to fire GitHub `repository_dispatch` every 5 minutes more reliably than GitHub `schedule` |
 | CI / Ops | GitHub Actions | Free for public repos | Public repos have unlimited minutes |
 
 ## Workflows
 
 | Workflow | Schedule | Version | Description |
 |---|---|---|---|
-| `keep-alive.yml` | `*/5 * * * *` | v1 + v2 | Checks `/readyz` first, falls back to `/healthz` if needed, only redeploys when the Django process is actually down, and runs a two-step smoke test after recovery |
-| `backup-supabase-r2.yml` | `0 3 * * *` | v1 + v3 | Creates a daily compressed `pg_dump` of the `public` schema, uploads it to R2, verifies integrity, tracks DB and R2 usage, and removes backups older than 7 days |
+| `keep-alive.yml` | `repository_dispatch` from Cloudflare Worker + `workflow_dispatch` | v1 + v2 + Worker trigger | Checks `/readyz` first, falls back to `/healthz` if needed, only redeploys when the Django process is actually down, and runs a two-step smoke test after recovery |
+| `backup-supabase-r2.yml` | `0 3,15 * * *` | v1 + v3 | Creates a compressed `pg_dump` of the `public` schema twice per day, uploads it to R2, verifies integrity, tracks DB and R2 usage, and removes backups older than 7 days |
 | `secret-scan.yml` | `push`, `pull_request` | v1 | Runs `detect-secrets` against the repository and fails when new secrets appear outside the baseline |
 | `weekly-report.yml` | `0 9 * * 1` | v2 | Aggregates the previous 7 days of liveness, readiness, redeploy, recovery, backup, and storage metrics into a weekly ops summary |
 | `supabase-keepalive.yml` | `0 */12 * * *` | v4 | Executes a direct `SELECT 1` against Supabase every 12 hours to avoid idle project pausing |
@@ -63,6 +64,41 @@ Notification routing:
 | `backup-supabase-r2.yml` | `DISCORD_WEBHOOK_URL` |
 | `supabase-keepalive.yml` | `DISCORD_WEBHOOK_URL` |
 | `weekly-report.yml` | `DISCORD_REPORT_WEBHOOK_URL` with fallback to `DISCORD_WEBHOOK_URL` |
+
+## Cloudflare Worker Keep-Alive Trigger
+
+GitHub `schedule` is best-effort and can drift noticeably on public repos. This
+repo now uses a Cloudflare Worker cron to trigger `keep-alive.yml` through
+GitHub `repository_dispatch`, while preserving manual runs with
+`workflow_dispatch`.
+
+Worker files live in
+[`cloudflare/keepalive-dispatch-worker`](./cloudflare/keepalive-dispatch-worker).
+
+### Worker setup
+
+1. Edit [`cloudflare/keepalive-dispatch-worker/wrangler.toml`](./cloudflare/keepalive-dispatch-worker/wrangler.toml) and set:
+   - `GITHUB_OWNER`
+   - `GITHUB_REPO`
+2. Create a GitHub fine-grained personal access token with `Contents: write`
+   access for this repository. `repository_dispatch` requires that permission.
+3. Store the token in Cloudflare, not in GitHub:
+
+```bash
+cd cloudflare/keepalive-dispatch-worker
+npx wrangler secret put GITHUB_DISPATCH_TOKEN
+```
+
+4. Deploy the Worker:
+
+```bash
+cd cloudflare/keepalive-dispatch-worker
+npx wrangler deploy
+```
+
+The Worker cron in [`cloudflare/keepalive-dispatch-worker/wrangler.toml`](./cloudflare/keepalive-dispatch-worker/wrangler.toml)
+is set to `*/5 * * * *`, and it dispatches the GitHub event type
+`keep-alive-tick`.
 
 ## Django Health Contract
 
@@ -223,7 +259,7 @@ common infra false positives.
 
 | Service | Expected usage | Free tier limit | Status |
 |---|---|---|---|
-| GitHub Actions | ~8,640 keep-alive runs/month plus daily backups and weekly reports | Unlimited minutes for public repos | Fits |
+| GitHub Actions | ~8,640 keep-alive runs/month plus twice-daily backups and weekly reports | Unlimited minutes for public repos | Fits |
 | Render Web Service | Continuous warm checks to avoid spin-down | 750 hours/month | Fits if you only keep the API alive you truly need |
 | Render Redis | Warmed indirectly by the Django health endpoint | 750 hours/month | Fits |
 | Supabase PostgreSQL | Production app database | 500 MB storage | Tracked by `backup-supabase-r2.yml` warnings at 400 MB |
@@ -235,7 +271,7 @@ common infra false positives.
 
 | Version | Includes |
 |---|---|
-| v1 | Keep-alive, Render auto-redeploy, daily Supabase backups to R2, detect-secrets CI |
+| v1 | Keep-alive, Render auto-redeploy, twice-daily Supabase backups to R2, detect-secrets CI |
 | v2 | Post-redeploy smoke test and weekly consolidated ops report |
 | v3 | Backup integrity verification plus DB and R2 size tracking |
 | v4 | Direct Supabase keepalive query to prevent free-tier pausing during prolonged API outages |

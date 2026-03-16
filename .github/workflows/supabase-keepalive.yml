@@ -86,6 +86,7 @@ jobs:
           python3 <<'PY' || true
           import json
           import os
+          import urllib.error
           import urllib.request
 
           repo = os.getenv("REPO", "")
@@ -98,7 +99,8 @@ jobs:
           if repo and run_id:
               lines.append(f"Run: https://github.com/{repo}/actions/runs/{run_id}")
 
-          payload = json.dumps({"content": "\n".join(lines)}).encode("utf-8")
+          message = "\n".join(lines)
+          payload = json.dumps({"content": message}).encode("utf-8")
           request = urllib.request.Request(
               os.environ["DISCORD_WEBHOOK_URL"],
               data=payload,
@@ -106,8 +108,19 @@ jobs:
           )
           try:
               urllib.request.urlopen(request, timeout=15).read()
+          except urllib.error.HTTPError as exc:
+              response_body = exc.read().decode("utf-8", errors="replace").strip()
+              response_body = response_body[:1000] if response_body else "<empty>"
+              content_type = exc.headers.get("Content-Type", "unknown")
+              print(f"Discord notification failed with HTTP {exc.code}.")
+              print(f"Discord response content-type: {content_type}")
+              print(f"Discord response body: {response_body}")
+              print("Discord fallback message:")
+              print(message)
           except Exception as exc:
               print(f"Discord notification failed: {exc}")
+              print("Discord fallback message:")
+              print(message)
           PY
 
       - name: Fail if Supabase remains unavailable

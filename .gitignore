@@ -31,6 +31,9 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.wrangler/
+.dev.vars
+.dev.vars.*
 
 # Logs
 *.log
