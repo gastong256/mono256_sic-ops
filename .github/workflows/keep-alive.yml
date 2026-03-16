@@ -13,6 +13,9 @@ jobs:
   keep-alive:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    env:
+      FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
     steps:
       - name: API health check
@@ -82,9 +85,7 @@ jobs:
 
       - name: Frontend health check
         id: frontend_check
-        if: ${{ secrets.FRONTEND_URL != '' }}
-        env:
-          FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+        if: ${{ env.FRONTEND_URL != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -242,7 +243,7 @@ jobs:
 
       - name: Mark frontend degraded
         id: mark_frontend_degraded
-        if: ${{ secrets.FRONTEND_URL != '' && steps.frontend_check.outputs.status == 'down' }}
+        if: ${{ env.FRONTEND_URL != '' && steps.frontend_check.outputs.status == 'down' }}
         continue-on-error: true
         shell: bash
         run: |
@@ -269,7 +270,7 @@ jobs:
         if: >-
           ${{
             always() &&
-            secrets.DISCORD_WEBHOOK_URL != '' &&
+            env.DISCORD_WEBHOOK_URL != '' &&
             (
               steps.api_check.outputs.status == 'down' ||
               steps.api_check.outputs.redis != 'up' ||
@@ -286,7 +287,6 @@ jobs:
           REDEPLOY_CODE: ${{ steps.redeploy.outputs.last_code }}
           SMOKE_RECOVERY: ${{ steps.smoke.outputs.recovery }}
           SMOKE_REDIS: ${{ steps.smoke.outputs.redis }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
         shell: bash
