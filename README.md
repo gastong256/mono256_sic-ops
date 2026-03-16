@@ -43,7 +43,25 @@ Add these in GitHub: `Settings -> Secrets and variables -> Actions`.
 | `R2_ENDPOINT` | Yes | `backup-supabase-r2`, `weekly-report` | S3-compatible endpoint, for example `https://<account-id>.r2.cloudflarestorage.com` | Cloudflare dashboard -> R2 overview |
 | `R2_BUCKET_NAME` | Yes | `backup-supabase-r2`, `weekly-report` | Bucket used to store backups | Name of the bucket you created in R2 |
 | `FRONTEND_URL` | No | `keep-alive` | Public frontend URL to check | Vercel project URL |
-| `DISCORD_WEBHOOK_URL` | No | All workflows | Discord webhook for alerts and weekly reports | Discord channel -> Integrations -> Webhooks |
+| `DISCORD_WEBHOOK_URL` | No | `keep-alive`, `backup-supabase-r2`, `supabase-keepalive`, fallback for `weekly-report` | Discord webhook for real-time alerts in `#ops-alerts` | Discord `#ops-alerts` channel -> Integrations -> Webhooks |
+| `DISCORD_REPORT_WEBHOOK_URL` | No | `weekly-report` | Dedicated Discord webhook for weekly reports in `#ops-reports` | Discord `#ops-reports` channel -> Integrations -> Webhooks |
+
+## Discord Channels
+
+Recommended setup:
+
+1. Create a webhook in `#ops-alerts` and save it as `DISCORD_WEBHOOK_URL`.
+2. Create a second webhook in `#ops-reports` and save it as `DISCORD_REPORT_WEBHOOK_URL`.
+3. If you only configure `DISCORD_WEBHOOK_URL`, alerts and the weekly report will still work because `weekly-report.yml` falls back to that webhook automatically.
+
+Notification routing:
+
+| Workflow | Discord secret |
+|---|---|
+| `keep-alive.yml` | `DISCORD_WEBHOOK_URL` |
+| `backup-supabase-r2.yml` | `DISCORD_WEBHOOK_URL` |
+| `supabase-keepalive.yml` | `DISCORD_WEBHOOK_URL` |
+| `weekly-report.yml` | `DISCORD_REPORT_WEBHOOK_URL` with fallback to `DISCORD_WEBHOOK_URL` |
 
 ## Django Health Contract
 

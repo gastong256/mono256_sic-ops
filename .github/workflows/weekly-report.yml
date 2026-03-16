@@ -336,11 +336,34 @@ jobs:
 
           printf '%s\n' "$report"
 
+      - name: Resolve Discord report webhook
+        id: report_webhook
+        shell: bash
+        env:
+          DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${DISCORD_REPORT_WEBHOOK_URL:-}" ]; then
+            echo "webhook_url=$DISCORD_REPORT_WEBHOOK_URL" >> "$GITHUB_OUTPUT"
+            echo "source=report" >> "$GITHUB_OUTPUT"
+            echo "Using DISCORD_REPORT_WEBHOOK_URL for weekly report delivery."
+          elif [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+            echo "webhook_url=$DISCORD_WEBHOOK_URL" >> "$GITHUB_OUTPUT"
+            echo "source=alerts-fallback" >> "$GITHUB_OUTPUT"
+            echo "DISCORD_REPORT_WEBHOOK_URL not set. Falling back to DISCORD_WEBHOOK_URL."
+          else
+            echo "webhook_url=" >> "$GITHUB_OUTPUT"
+            echo "source=log-only" >> "$GITHUB_OUTPUT"
+            echo "No Discord webhook configured. Weekly report will stay in the workflow log."
+          fi
+
       - name: Send weekly report to Discord
-        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        if: ${{ steps.report_webhook.outputs.webhook_url != '' }}
         env:
           REPORT: ${{ steps.compose.outputs.report }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ steps.report_webhook.outputs.webhook_url }}
         shell: bash
         run: |
           set -euo pipefail
