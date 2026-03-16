@@ -370,33 +370,44 @@ jobs:
             exit 0
           fi
 
-          export RESOLVED_DISCORD_WEBHOOK_URL="$webhook_url"
-          python3 <<'PY' || true
-          import json
-          import os
-          import urllib.error
-          import urllib.request
+          payload_file="$(mktemp)"
+          response_file="$(mktemp)"
+          headers_file="$(mktemp)"
 
-          message = os.environ["REPORT"]
-          payload = json.dumps({"content": message}).encode("utf-8")
-          request = urllib.request.Request(
-              os.environ["RESOLVED_DISCORD_WEBHOOK_URL"],
-              data=payload,
-              headers={"Content-Type": "application/json"},
-          )
-          try:
-              urllib.request.urlopen(request, timeout=15).read()
-          except urllib.error.HTTPError as exc:
-              response_body = exc.read().decode("utf-8", errors="replace").strip()
-              response_body = response_body[:1000] if response_body else "<empty>"
-              content_type = exc.headers.get("Content-Type", "unknown")
-              print(f"Discord notification failed with HTTP {exc.code}.")
-              print(f"Discord response content-type: {content_type}")
-              print(f"Discord response body: {response_body}")
-              print("Discord fallback message:")
-              print(message)
-          except Exception as exc:
-              print(f"Discord notification failed: {exc}")
-              print("Discord fallback message:")
-              print(message)
+          python3 - "$REPORT" > "$payload_file" <<'PY'
+          import json
+          import sys
+
+          print(json.dumps({"content": sys.argv[1]}))
           PY
+
+          http_code="$(
+            curl -sS --max-time 15 \
+              -D "$headers_file" \
+              -o "$response_file" \
+              -w "%{http_code}" \
+              -X POST \
+              -H "Content-Type: application/json" \
+              --data-binary "@${payload_file}" \
+              "$webhook_url"
+          )" || http_code="000"
+
+          if [ "$http_code" = "200" ] || [ "$http_code" = "204" ]; then
+            echo "Discord weekly report sent successfully."
+          else
+            content_type="$(
+              awk -F': ' 'tolower($1) == "content-type" {print $2}' "$headers_file" |
+              tr -d '\r' |
+              tail -n 1
+            )"
+            content_type="${content_type:-unknown}"
+            response_body="$(head -c 1000 "$response_file" || true)"
+            response_body="${response_body:-<empty>}"
+            echo "Discord notification failed with HTTP ${http_code}."
+            echo "Discord response content-type: ${content_type}"
+            echo "Discord response body: ${response_body}"
+            echo "Discord fallback message:"
+            printf '%s\n' "$REPORT"
+          fi
+
+          rm -f "$payload_file" "$response_file" "$headers_file"
