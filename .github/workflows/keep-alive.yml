@@ -12,16 +12,96 @@ permissions:
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     env:
-      FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+      API_HEALTH_URL: ${{ secrets.API_HEALTH_URL }}
+      API_READY_URL: ${{ secrets.API_READY_URL }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
 
     steps:
-      - name: API health check
-        id: api_check
-        env:
-          API_HEALTH_URL: ${{ secrets.API_HEALTH_URL }}
+      - name: Readiness check
+        id: readiness_check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${API_READY_URL:-}" ]; then
+            echo "::error::API_READY_URL is required."
+            exit 1
+          fi
+
+          body_file="$(mktemp)"
+          status="no_response"
+          redis="unknown"
+          db="unknown"
+          last_code="000"
+
+          parse_dependencies() {
+            python3 - "$1" <<'PY'
+            import json
+            import sys
+
+            result = {"redis": "unknown", "db": "unknown"}
+            try:
+                with open(sys.argv[1], "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except Exception:
+                for key, value in result.items():
+                    print(f"{key}={value}")
+                raise SystemExit(0)
+
+            for key in ("redis", "db"):
+                value = payload.get(key, "missing")
+                if value is True:
+                    result[key] = "up"
+                elif value is False:
+                    result[key] = "down"
+
+            for key, value in result.items():
+                print(f"{key}={value}")
+            PY
+          }
+
+          for attempt in 1 2 3; do
+            echo "Checking API readiness at /readyz (attempt ${attempt}/3)..."
+            if code="$(curl -sS --max-time 15 -o "$body_file" -w "%{http_code}" "$API_READY_URL")"; then
+              last_code="$code"
+              eval "$(parse_dependencies "$body_file")"
+
+              if [ "$code" = "200" ]; then
+                status="ready"
+                echo "API is ready. Redis: ${redis}. DB: ${db}."
+                break
+              fi
+
+              if [ "$code" = "503" ]; then
+                status="dependency_failure"
+                echo "::warning::API is alive but not ready. Redis: ${redis}. DB: ${db}."
+                break
+              fi
+
+              status="unexpected_status"
+              echo "::warning::Readiness endpoint returned unexpected HTTP ${code}. Redis: ${redis}. DB: ${db}."
+              break
+            fi
+
+            last_code="000"
+            echo "Readiness request failed or timed out."
+            if [ "$attempt" -lt 3 ]; then
+              sleep 10
+            fi
+          done
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "redis=$redis" >> "$GITHUB_OUTPUT"
+          echo "db=$db" >> "$GITHUB_OUTPUT"
+          echo "last_code=$last_code" >> "$GITHUB_OUTPUT"
+
+      - name: Liveness check
+        id: liveness_check
+        if: ${{ steps.readiness_check.outputs.status == 'no_response' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -31,56 +111,30 @@ jobs:
             exit 1
           fi
 
-          body_file="$(mktemp)"
           status="down"
-          redis="unknown"
           last_code="000"
 
-          parse_redis() {
-          python3 - "$1" <<'PY'
-          import json
-          import sys
-
-          try:
-              with open(sys.argv[1], "r", encoding="utf-8") as handle:
-                  payload = json.load(handle)
-          except Exception:
-              print("unknown")
-              raise SystemExit(0)
-
-          value = payload.get("redis", "missing")
-          if value is True:
-              print("up")
-          elif value is False:
-              print("down")
-          else:
-              print("unknown")
-          PY
-          }
-
-          for attempt in 1 2 3; do
-            echo "Checking API health (attempt ${attempt}/3)..."
-            if code="$(curl -sS --max-time 15 -o "$body_file" -w "%{http_code}" "$API_HEALTH_URL")"; then
+          for attempt in 1 2; do
+            echo "Checking API liveness at /healthz (attempt ${attempt}/2)..."
+            if code="$(curl -sS --max-time 15 -o /tmp/healthz_response.txt -w "%{http_code}" "$API_HEALTH_URL")"; then
               last_code="$code"
               if [ "$code" = "200" ]; then
                 status="up"
-                redis="$(parse_redis "$body_file")"
-                echo "API is up. Redis status: ${redis}."
+                echo "Django process is alive."
                 break
               fi
-              echo "API returned HTTP ${code}."
+              echo "Liveness endpoint returned HTTP ${code}."
             else
               last_code="000"
-              echo "API request failed or timed out."
+              echo "Liveness request failed or timed out."
             fi
 
-            if [ "$attempt" -lt 3 ]; then
+            if [ "$attempt" -lt 2 ]; then
               sleep 10
             fi
           done
 
           echo "status=$status" >> "$GITHUB_OUTPUT"
-          echo "redis=$redis" >> "$GITHUB_OUTPUT"
           echo "last_code=$last_code" >> "$GITHUB_OUTPUT"
 
       - name: Frontend health check
@@ -106,20 +160,22 @@ jobs:
 
       - name: Auto-redeploy on Render
         id: redeploy
-        if: ${{ steps.api_check.outputs.status == 'down' }}
-        env:
-          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        if: >-
+          ${{
+            steps.readiness_check.outputs.status == 'no_response' &&
+            steps.liveness_check.outputs.status == 'down'
+          }}
         shell: bash
         run: |
           set -euo pipefail
 
           if [ -z "${RENDER_DEPLOY_HOOK_URL:-}" ]; then
             echo "status=failed" >> "$GITHUB_OUTPUT"
-            echo "::error::RENDER_DEPLOY_HOOK_URL is required when the API is down."
+            echo "::error::RENDER_DEPLOY_HOOK_URL is required when the Django process is down."
             exit 1
           fi
 
-          echo "Triggering Render redeploy hook via POST..."
+          echo "Django process is down. Triggering Render redeploy hook..."
           method="POST"
           code="$(curl -sS --max-time 15 -o /tmp/render_redeploy.txt -w "%{http_code}" \
             -X POST "$RENDER_DEPLOY_HOOK_URL")" || code="000"
@@ -146,99 +202,126 @@ jobs:
       - name: Smoke test after redeploy
         id: smoke
         if: ${{ steps.redeploy.outputs.status == 'success' }}
-        env:
-          API_HEALTH_URL: ${{ secrets.API_HEALTH_URL }}
         shell: bash
         run: |
           set -euo pipefail
 
-          body_file="$(mktemp)"
-          status="down"
+          health_status="down"
+          health_code="000"
+          ready_status="not_checked"
+          ready_code="000"
           redis="unknown"
-          last_code="000"
+          db="unknown"
           recovery="failed"
+          ready_body="$(mktemp)"
 
-          parse_redis() {
-          python3 - "$1" <<'PY'
-          import json
-          import sys
+          parse_dependencies() {
+            python3 - "$1" <<'PY'
+            import json
+            import sys
 
-          try:
-              with open(sys.argv[1], "r", encoding="utf-8") as handle:
-                  payload = json.load(handle)
-          except Exception:
-              print("unknown")
-              raise SystemExit(0)
+            result = {"redis": "unknown", "db": "unknown"}
+            try:
+                with open(sys.argv[1], "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except Exception:
+                for key, value in result.items():
+                    print(f"{key}={value}")
+                raise SystemExit(0)
 
-          value = payload.get("redis", "missing")
-          if value is True:
-              print("up")
-          elif value is False:
-              print("down")
-          else:
-              print("unknown")
-          PY
+            for key in ("redis", "db"):
+                value = payload.get(key, "missing")
+                if value is True:
+                    result[key] = "up"
+                elif value is False:
+                    result[key] = "down"
+
+            for key, value in result.items():
+                print(f"{key}={value}")
+            PY
           }
 
           echo "Waiting 90 seconds for Render cold start..."
           sleep 90
 
-          for attempt in 1 2 3 4 5; do
-            echo "Running smoke test (attempt ${attempt}/5)..."
-            if code="$(curl -sS --max-time 15 -o "$body_file" -w "%{http_code}" "$API_HEALTH_URL")"; then
-              last_code="$code"
+          for attempt in 1 2 3; do
+            echo "Checking /healthz after redeploy (attempt ${attempt}/3)..."
+            if code="$(curl -sS --max-time 15 -o /tmp/smoke_healthz.txt -w "%{http_code}" "$API_HEALTH_URL")"; then
+              health_code="$code"
               if [ "$code" = "200" ]; then
-                status="up"
-                redis="$(parse_redis "$body_file")"
-                recovery="success"
-                echo "Recovery check passed. Redis status: ${redis}."
+                health_status="up"
+                echo "Django process started successfully."
                 break
               fi
-              echo "Smoke test returned HTTP ${code}."
+              echo "Smoke liveness check returned HTTP ${code}."
             else
-              last_code="000"
-              echo "Smoke test request failed or timed out."
+              health_code="000"
+              echo "Smoke liveness request failed or timed out."
             fi
 
-            if [ "$attempt" -lt 5 ]; then
+            if [ "$attempt" -lt 3 ]; then
               sleep 30
             fi
           done
 
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          echo "redis=$redis" >> "$GITHUB_OUTPUT"
-          echo "last_code=$last_code" >> "$GITHUB_OUTPUT"
-          echo "recovery=$recovery" >> "$GITHUB_OUTPUT"
+          if [ "$health_status" = "up" ]; then
+            for attempt in 1 2 3; do
+              echo "Checking /readyz after redeploy (attempt ${attempt}/3)..."
+              if code="$(curl -sS --max-time 15 -o "$ready_body" -w "%{http_code}" "$API_READY_URL")"; then
+                ready_code="$code"
+                eval "$(parse_dependencies "$ready_body")"
 
-          if [ "$recovery" != "success" ]; then
-            echo "::error::Smoke test did not recover the API after redeploy."
-            exit 1
+                if [ "$code" = "200" ]; then
+                  ready_status="ready"
+                  recovery="complete"
+                  echo "Recovery complete. Redis: ${redis}. DB: ${db}."
+                  break
+                fi
+
+                if [ "$code" = "503" ]; then
+                  ready_status="dependency_failure"
+                  recovery="partial"
+                  echo "::warning::Process recovered but readiness still failing. Redis: ${redis}. DB: ${db}."
+                  break
+                fi
+
+                ready_status="unexpected_status"
+                recovery="partial"
+                echo "::warning::Readyz returned unexpected HTTP ${code} after redeploy. Redis: ${redis}. DB: ${db}."
+                break
+              fi
+
+              ready_code="000"
+              echo "Smoke readiness request failed or timed out."
+              if [ "$attempt" -lt 3 ]; then
+                sleep 30
+              fi
+            done
           fi
 
-      - name: Mark API unavailable
-        id: mark_api_unavailable
-        if: >-
-          ${{
-            steps.api_check.outputs.status == 'down' &&
-            steps.smoke.outputs.recovery != 'success'
-          }}
-        continue-on-error: true
-        shell: bash
-        run: |
-          echo "::error::API stayed unavailable after the recovery flow."
-          exit 1
+          echo "health_status=$health_status" >> "$GITHUB_OUTPUT"
+          echo "health_code=$health_code" >> "$GITHUB_OUTPUT"
+          echo "ready_status=$ready_status" >> "$GITHUB_OUTPUT"
+          echo "ready_code=$ready_code" >> "$GITHUB_OUTPUT"
+          echo "redis=$redis" >> "$GITHUB_OUTPUT"
+          echo "db=$db" >> "$GITHUB_OUTPUT"
+          echo "recovery=$recovery" >> "$GITHUB_OUTPUT"
 
-      - name: Mark Redis degraded
-        id: mark_redis_degraded
+      - name: Mark readiness degraded
+        id: mark_readiness_degraded
         if: >-
           ${{
-            (steps.api_check.outputs.status == 'up' && steps.api_check.outputs.redis != 'up') ||
-            (steps.smoke.outputs.recovery == 'success' && steps.smoke.outputs.redis != 'up')
+            steps.readiness_check.outputs.status == 'dependency_failure' ||
+            steps.readiness_check.outputs.status == 'unexpected_status' ||
+            (
+              steps.readiness_check.outputs.status == 'no_response' &&
+              steps.liveness_check.outputs.status == 'up'
+            )
           }}
         continue-on-error: true
         shell: bash
         run: |
-          echo "::warning::Redis did not report a healthy state."
+          echo "::warning::API process is alive but not ready to serve requests."
           exit 1
 
       - name: Mark frontend degraded
@@ -250,11 +333,21 @@ jobs:
           echo "::warning::Frontend health check failed."
           exit 1
 
-      - name: Mark recovery failed
-        id: mark_recovery_failed
+      - name: Mark recovery degraded
+        id: mark_recovery_degraded
+        if: ${{ steps.smoke.outputs.recovery == 'partial' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "::warning::Django process recovered but dependencies are still failing."
+          exit 1
+
+      - name: Mark process unavailable
+        id: mark_process_unavailable
         if: >-
           ${{
-            steps.api_check.outputs.status == 'down' &&
+            steps.readiness_check.outputs.status == 'no_response' &&
+            steps.liveness_check.outputs.status == 'down' &&
             (
               steps.redeploy.outputs.status == 'failed' ||
               steps.smoke.outputs.recovery == 'failed'
@@ -263,7 +356,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          echo "::error::Redeploy was triggered but recovery did not complete cleanly."
+          echo "::error::Django process stayed unavailable after the recovery flow."
           exit 1
 
       - name: Notify Discord
@@ -272,88 +365,121 @@ jobs:
             always() &&
             env.DISCORD_WEBHOOK_URL != '' &&
             (
-              steps.api_check.outputs.status == 'down' ||
-              steps.api_check.outputs.redis != 'up' ||
-              steps.smoke.outputs.redis == 'down' ||
-              steps.frontend_check.outputs.status == 'down'
+              steps.mark_readiness_degraded.outcome == 'failure' ||
+              steps.mark_frontend_degraded.outcome == 'failure' ||
+              steps.mark_recovery_degraded.outcome == 'failure' ||
+              steps.mark_process_unavailable.outcome == 'failure' ||
+              steps.redeploy.outputs.status == 'success'
             )
           }}
         env:
-          API_STATUS: ${{ steps.api_check.outputs.status }}
-          API_CODE: ${{ steps.api_check.outputs.last_code }}
-          REDIS_STATUS: ${{ steps.api_check.outputs.redis }}
           FRONTEND_STATUS: ${{ steps.frontend_check.outputs.status }}
-          REDEPLOY_STATUS: ${{ steps.redeploy.outputs.status }}
+          LIVENESS_CODE: ${{ steps.liveness_check.outputs.last_code }}
+          LIVENESS_STATUS: ${{ steps.liveness_check.outputs.status }}
+          READINESS_CODE: ${{ steps.readiness_check.outputs.last_code }}
+          READINESS_DB: ${{ steps.readiness_check.outputs.db }}
+          READINESS_REDIS: ${{ steps.readiness_check.outputs.redis }}
+          READINESS_STATUS: ${{ steps.readiness_check.outputs.status }}
           REDEPLOY_CODE: ${{ steps.redeploy.outputs.last_code }}
-          SMOKE_RECOVERY: ${{ steps.smoke.outputs.recovery }}
-          SMOKE_REDIS: ${{ steps.smoke.outputs.redis }}
+          REDEPLOY_STATUS: ${{ steps.redeploy.outputs.status }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          SMOKE_DB: ${{ steps.smoke.outputs.db }}
+          SMOKE_HEALTH_CODE: ${{ steps.smoke.outputs.health_code }}
+          SMOKE_HEALTH_STATUS: ${{ steps.smoke.outputs.health_status }}
+          SMOKE_READY_CODE: ${{ steps.smoke.outputs.ready_code }}
+          SMOKE_READY_STATUS: ${{ steps.smoke.outputs.ready_status }}
+          SMOKE_RECOVERY: ${{ steps.smoke.outputs.recovery }}
+          SMOKE_REDIS: ${{ steps.smoke.outputs.redis }}
         shell: bash
         run: |
           set -euo pipefail
-
-          export MESSAGE="$(
-            python3 <<'PY'
-            import os
-
-            lines = ["Ops alert from keep-alive workflow:"]
-
-            api_status = os.getenv("API_STATUS", "")
-            api_code = os.getenv("API_CODE", "unknown")
-            redis_status = os.getenv("REDIS_STATUS", "")
-            frontend_status = os.getenv("FRONTEND_STATUS", "")
-            redeploy_status = os.getenv("REDEPLOY_STATUS", "")
-            redeploy_code = os.getenv("REDEPLOY_CODE", "")
-            smoke_recovery = os.getenv("SMOKE_RECOVERY", "")
-            smoke_redis = os.getenv("SMOKE_REDIS", "")
-
-            if api_status == "down":
-                lines.append(f"- API health check failed (last HTTP code: {api_code}).")
-            if redis_status == "down":
-                lines.append("- Redis reported unhealthy on the primary API check.")
-            elif redis_status == "unknown" and api_status == "up":
-                lines.append("- Redis status could not be confirmed from the health payload.")
-
-            if frontend_status == "down":
-                lines.append("- Frontend health check failed.")
-
-            if redeploy_status == "success":
-                lines.append(
-                    f"- Render redeploy hook accepted (HTTP {redeploy_code or 'unknown'})."
-                )
-            elif redeploy_status == "failed":
-                lines.append(
-                    f"- Render redeploy hook failed (HTTP {redeploy_code or 'unknown'})."
-                )
-
-            if smoke_recovery == "success":
-                lines.append("- Post-redeploy smoke test recovered successfully.")
-                if smoke_redis == "down":
-                    lines.append("- Redis was still unhealthy after recovery.")
-                elif smoke_redis == "unknown":
-                    lines.append("- Redis status stayed unknown after recovery.")
-            elif smoke_recovery == "failed":
-                lines.append("- Post-redeploy smoke test failed.")
-
-            repo = os.getenv("REPO", "")
-            run_id = os.getenv("RUN_ID", "")
-            if repo and run_id:
-                lines.append(f"- Run: https://github.com/{repo}/actions/runs/{run_id}")
-
-            print("\n".join(lines))
-            PY
-          )"
 
           python3 <<'PY' || true
           import json
           import os
           import urllib.request
 
-          webhook = os.environ["DISCORD_WEBHOOK_URL"]
-          payload = json.dumps({"content": os.environ["MESSAGE"]}).encode("utf-8")
+
+          def symbol(value: str) -> str:
+              if value == "up":
+                  return "✓"
+              if value == "down":
+                  return "❌"
+              return "?"
+
+
+          def deps_summary(redis_value: str, db_value: str) -> str:
+              return f"Redis: {symbol(redis_value)}, DB: {symbol(db_value)}"
+
+
+          lines = ["Ops alert from keep-alive workflow:"]
+
+          readiness_status = os.getenv("READINESS_STATUS", "")
+          readiness_code = os.getenv("READINESS_CODE", "unknown")
+          readiness_redis = os.getenv("READINESS_REDIS", "unknown")
+          readiness_db = os.getenv("READINESS_DB", "unknown")
+          liveness_status = os.getenv("LIVENESS_STATUS", "")
+          liveness_code = os.getenv("LIVENESS_CODE", "unknown")
+          redeploy_status = os.getenv("REDEPLOY_STATUS", "")
+          redeploy_code = os.getenv("REDEPLOY_CODE", "unknown")
+          smoke_recovery = os.getenv("SMOKE_RECOVERY", "")
+          smoke_health_status = os.getenv("SMOKE_HEALTH_STATUS", "")
+          smoke_health_code = os.getenv("SMOKE_HEALTH_CODE", "unknown")
+          smoke_ready_status = os.getenv("SMOKE_READY_STATUS", "")
+          smoke_ready_code = os.getenv("SMOKE_READY_CODE", "unknown")
+          smoke_redis = os.getenv("SMOKE_REDIS", "unknown")
+          smoke_db = os.getenv("SMOKE_DB", "unknown")
+          frontend_status = os.getenv("FRONTEND_STATUS", "")
+
+          if readiness_status in {"dependency_failure", "unexpected_status"}:
+              lines.append(
+                  "API respondiendo pero dependencias caidas "
+                  f"({deps_summary(readiness_redis, readiness_db)}). "
+                  "No se redeploya. Revisar manualmente."
+              )
+              if readiness_status == "unexpected_status":
+                  lines.append(f"Readiness devolvio HTTP {readiness_code}.")
+          elif readiness_status == "no_response" and liveness_status == "up":
+              lines.append(
+                  "API respondiendo pero no esta lista para atender requests. "
+                  "No se redeploya. Revisar manualmente."
+              )
+              lines.append(
+                  f"Liveness OK; readiness sin respuesta (healthz HTTP {liveness_code})."
+              )
+
+          if readiness_status == "no_response" and liveness_status == "down":
+              lines.append("API caida (proceso no responde). Redeploy iniciado.")
+              if redeploy_status == "success" and smoke_recovery == "complete":
+                  lines.append("API caida. Redeploy completado. Recovery exitosa.")
+              elif redeploy_status == "success" and smoke_recovery == "partial":
+                  lines.append(
+                      "API caida. Redeploy completado pero dependencias siguen fallando "
+                      f"({deps_summary(smoke_redis, smoke_db)}). Requiere intervencion."
+                  )
+              elif redeploy_status == "failed" or smoke_health_status == "down" or smoke_recovery == "failed":
+                  lines.append("API caida. Redeploy FALLO. Proceso no arranco. Intervencion urgente.")
+                  if redeploy_status == "failed":
+                      lines.append(f"Deploy hook devolvio HTTP {redeploy_code}.")
+                  elif smoke_health_status == "down":
+                      lines.append(
+                          f"Smoke healthz sin respuesta (ultimo HTTP {smoke_health_code})."
+                      )
+                  elif smoke_ready_status == "unexpected_status":
+                      lines.append(f"Smoke readyz devolvio HTTP {smoke_ready_code}.")
+
+          if frontend_status == "down":
+              lines.append("Frontend caido. Revisar Vercel.")
+
+          repo = os.getenv("REPO", "")
+          run_id = os.getenv("RUN_ID", "")
+          if repo and run_id:
+              lines.append(f"Run: https://github.com/{repo}/actions/runs/{run_id}")
+
+          payload = json.dumps({"content": "\n".join(lines)}).encode("utf-8")
           request = urllib.request.Request(
-              webhook,
+              os.environ["DISCORD_WEBHOOK_URL"],
               data=payload,
               headers={"Content-Type": "application/json"},
           )
@@ -369,10 +495,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "${{ steps.mark_api_unavailable.outcome }}" = "failure" ] || \
-             [ "${{ steps.mark_redis_degraded.outcome }}" = "failure" ] || \
+          if [ "${{ steps.mark_readiness_degraded.outcome }}" = "failure" ] || \
              [ "${{ steps.mark_frontend_degraded.outcome }}" = "failure" ] || \
-             [ "${{ steps.mark_recovery_failed.outcome }}" = "failure" ]; then
+             [ "${{ steps.mark_recovery_degraded.outcome }}" = "failure" ] || \
+             [ "${{ steps.mark_process_unavailable.outcome }}" = "failure" ]; then
             echo "::error::One or more monitored components need attention."
             exit 1
           fi

@@ -21,10 +21,10 @@ All credentials live in GitHub Actions secrets. No secrets belong in code.
 
 | Workflow | Schedule | Version | Description |
 |---|---|---|---|
-| `keep-alive.yml` | `*/5 * * * *` | v1 + v2 | Keeps Django and Redis warm through `/health/`, optionally checks frontend, triggers Render redeploy, then runs a smoke test after recovery |
+| `keep-alive.yml` | `*/5 * * * *` | v1 + v2 | Checks `/readyz` first, falls back to `/healthz` if needed, only redeploys when the Django process is actually down, and runs a two-step smoke test after recovery |
 | `backup-supabase-r2.yml` | `0 3 * * *` | v1 + v3 | Creates a daily compressed `pg_dump`, uploads it to R2, verifies integrity, tracks DB and R2 usage, and removes backups older than 7 days |
 | `secret-scan.yml` | `push`, `pull_request` | v1 | Runs `detect-secrets` against the repository and fails when new secrets appear outside the baseline |
-| `weekly-report.yml` | `0 9 * * 1` | v2 | Aggregates GitHub Actions health metrics for the previous 7 days and posts a weekly ops summary |
+| `weekly-report.yml` | `0 9 * * 1` | v2 | Aggregates the previous 7 days of liveness, readiness, redeploy, recovery, backup, and storage metrics into a weekly ops summary |
 | `supabase-keepalive.yml` | `0 */12 * * *` | v4 | Executes a direct `SELECT 1` against Supabase every 12 hours to avoid idle project pausing |
 
 ## Required Secrets
@@ -33,7 +33,8 @@ Add these in GitHub: `Settings -> Secrets and variables -> Actions`.
 
 | Secret | Required | Used by | Description | Where to get it |
 |---|---|---|---|---|
-| `API_HEALTH_URL` | Yes | `keep-alive`, `weekly-report` | Full Django health endpoint URL, usually `/health/` | Render service URL plus your health path |
+| `API_HEALTH_URL` | Yes | `keep-alive` | Full Django liveness endpoint URL, usually `/healthz` | Render service URL plus your liveness path |
+| `API_READY_URL` | Yes | `keep-alive` | Full Django readiness endpoint URL, usually `/readyz` | Render service URL plus your readiness path |
 | `RENDER_DEPLOY_HOOK_URL` | Yes | `keep-alive` | Render deploy hook used for auto-redeploy | Render dashboard -> service -> Settings -> Deploy Hook |
 | `SUPABASE_DB_HOST` | Yes | `backup-supabase-r2`, `supabase-keepalive` | PostgreSQL host for the Supabase project | Supabase dashboard -> Project Settings -> Database |
 | `SUPABASE_DB_USER` | Yes | `backup-supabase-r2`, `supabase-keepalive` | PostgreSQL username, commonly `postgres` | Supabase dashboard -> Project Settings -> Database |
@@ -65,17 +66,43 @@ Notification routing:
 
 ## Django Health Contract
 
-`keep-alive.yml` expects the Django health endpoint to return JSON like this:
+`keep-alive.yml` now uses two endpoints:
+
+- `/healthz`: liveness only. It should return HTTP `200` when the Django process is alive.
+- `/readyz`: readiness. It should return HTTP `200` when the service can actually serve traffic, and `503` when a dependency is unavailable.
+
+The readiness body should look like this:
 
 ```json
 {
-  "status": "ok",
-  "redis": true
+  "redis": true,
+  "db": true
 }
 ```
 
-The endpoint should perform a `cache.set()` and `cache.get()` on each request so a
-single HTTP call keeps both the Django service and the Redis instance active.
+`/readyz` should actively check Redis and the database connection on every call.
+
+### Decision flow
+
+`keep-alive.yml` follows this sequence:
+
+1. Call `/readyz` first.
+2. If `/readyz` returns `200`, the API, Redis, and DB are healthy.
+3. If `/readyz` returns `503`, the Django process is alive but one or more dependencies are down. The workflow alerts, but does not redeploy.
+4. If `/readyz` does not respond, call `/healthz`.
+5. If `/healthz` returns `200`, the Django process is alive but not ready. The workflow alerts, but does not redeploy.
+6. Only if `/healthz` also fails does the workflow trigger the Render deploy hook.
+
+This is intentional: redeploying does not fix Redis or Supabase outages, so the
+workflow only redeploys when the Django process itself is dead.
+
+### Post-redeploy smoke test
+
+After a redeploy the workflow waits 90 seconds, then:
+
+1. Checks `/healthz` to confirm the process started.
+2. If the process is up, checks `/readyz` to confirm Redis and DB recovered.
+3. Reports one of three states: full recovery, process recovered but dependencies still failing, or recovery failed.
 
 ## Restore a Backup
 

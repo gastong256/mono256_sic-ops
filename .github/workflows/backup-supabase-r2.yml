@@ -33,7 +33,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes postgresql-client
+          sudo apt-get install --yes postgresql-client-17
+          pg_dump --version
 
       - name: Create compressed database dump
         id: dump
@@ -201,60 +202,52 @@ jobs:
         run: |
           set -euo pipefail
 
-          export MESSAGE="$(
-            python3 <<'PY'
-            import os
-
-            def humanize(num: str) -> str:
-                try:
-                    value = int(num)
-                except Exception:
-                    return "unknown"
-                units = ["B", "KiB", "MiB", "GiB", "TiB"]
-                idx = 0
-                size = float(value)
-                while size >= 1024 and idx < len(units) - 1:
-                    size /= 1024
-                    idx += 1
-                return f"{size:.1f} {units[idx]}"
-
-            lines = ["Ops alert from backup workflow:"]
-            archive = os.getenv("ARCHIVE_FILE", "")
-            if archive:
-                lines.append(f"- Backup file: {archive}")
-
-            lines.append(
-                f"- Backup verification step: {os.getenv('VERIFY_RESULT', 'unknown')}."
-            )
-            lines.append(
-                f"- Compressed size: {humanize(os.getenv('COMPRESSED_BYTES', '0'))}; "
-                f"estimated DB size: {humanize(os.getenv('ORIGINAL_BYTES', '0'))}."
-            )
-            lines.append(
-                f"- R2 usage: {humanize(os.getenv('TOTAL_BYTES', '0'))} "
-                f"across {os.getenv('OBJECT_COUNT', '0')} object(s)."
-            )
-
-            if os.getenv("DB_WARNING") == "true":
-                lines.append("- Warning: estimated database size is above 400 MiB.")
-            if os.getenv("STORAGE_WARNING") == "true":
-                lines.append("- Warning: R2 usage is above 8 GiB.")
-
-            repo = os.getenv("REPO", "")
-            run_id = os.getenv("RUN_ID", "")
-            if repo and run_id:
-                lines.append(f"- Run: https://github.com/{repo}/actions/runs/{run_id}")
-
-            print("\n".join(lines))
-            PY
-          )"
-
           python3 <<'PY' || true
           import json
           import os
           import urllib.request
 
-          payload = json.dumps({"content": os.environ["MESSAGE"]}).encode("utf-8")
+          def humanize(num: str) -> str:
+              try:
+                  value = int(num)
+              except Exception:
+                  return "unknown"
+              units = ["B", "KiB", "MiB", "GiB", "TiB"]
+              idx = 0
+              size = float(value)
+              while size >= 1024 and idx < len(units) - 1:
+                  size /= 1024
+                  idx += 1
+              return f"{size:.1f} {units[idx]}"
+
+          lines = ["Ops alert from backup workflow:"]
+          archive = os.getenv("ARCHIVE_FILE", "")
+          if archive:
+              lines.append(f"- Backup file: {archive}")
+
+          lines.append(
+              f"- Backup verification step: {os.getenv('VERIFY_RESULT', 'unknown')}."
+          )
+          lines.append(
+              f"- Compressed size: {humanize(os.getenv('COMPRESSED_BYTES', '0'))}; "
+              f"estimated DB size: {humanize(os.getenv('ORIGINAL_BYTES', '0'))}."
+          )
+          lines.append(
+              f"- R2 usage: {humanize(os.getenv('TOTAL_BYTES', '0'))} "
+              f"across {os.getenv('OBJECT_COUNT', '0')} object(s)."
+          )
+
+          if os.getenv("DB_WARNING") == "true":
+              lines.append("- Warning: estimated database size is above 400 MiB.")
+          if os.getenv("STORAGE_WARNING") == "true":
+              lines.append("- Warning: R2 usage is above 8 GiB.")
+
+          repo = os.getenv("REPO", "")
+          run_id = os.getenv("RUN_ID", "")
+          if repo and run_id:
+              lines.append(f"- Run: https://github.com/{repo}/actions/runs/{run_id}")
+
+          payload = json.dumps({"content": "\n".join(lines)}).encode("utf-8")
           request = urllib.request.Request(
               os.environ["DISCORD_WEBHOOK_URL"],
               data=payload,

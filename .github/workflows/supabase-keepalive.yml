@@ -25,7 +25,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes postgresql-client
+          sudo apt-get install --yes postgresql-client-17
+          psql --version
 
       - name: Run Supabase keepalive query
         id: keepalive_query
@@ -71,29 +72,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          export MESSAGE="$(
-            python3 <<'PY'
-            import os
-
-            repo = os.getenv("REPO", "")
-            run_id = os.getenv("RUN_ID", "")
-            lines = [
-                "Supabase keepalive failed after 2 attempts.",
-                "Verify whether the free-tier project was paused in the dashboard.",
-                "Restore path: Supabase Dashboard -> your project -> Restore button.",
-            ]
-            if repo and run_id:
-                lines.append(f"Run: https://github.com/{repo}/actions/runs/{run_id}")
-            print("\n".join(lines))
-            PY
-          )"
-
           python3 <<'PY' || true
           import json
           import os
           import urllib.request
 
-          payload = json.dumps({"content": os.environ["MESSAGE"]}).encode("utf-8")
+          repo = os.getenv("REPO", "")
+          run_id = os.getenv("RUN_ID", "")
+          lines = [
+              "Supabase keepalive failed after 2 attempts.",
+              "Verify whether the free-tier project was paused in the dashboard.",
+              "Restore path: Supabase Dashboard -> your project -> Restore button.",
+          ]
+          if repo and run_id:
+              lines.append(f"Run: https://github.com/{repo}/actions/runs/{run_id}")
+
+          payload = json.dumps({"content": "\n".join(lines)}).encode("utf-8")
           request = urllib.request.Request(
               os.environ["DISCORD_WEBHOOK_URL"],
               data=payload,

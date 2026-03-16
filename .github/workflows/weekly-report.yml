@@ -109,8 +109,10 @@ jobs:
           )
 
           redeploys = 0
-          recoveries = 0
-          redis_warnings = 0
+          full_recoveries = 0
+          partial_recoveries = 0
+          failed_recoveries = 0
+          readiness_incidents = 0
           frontend_checks = 0
           frontend_failures = 0
 
@@ -123,12 +125,25 @@ jobs:
                       redeploys += 1
 
               smoke_step = find_step(steps, "Smoke test after redeploy")
-              if smoke_step and smoke_step.get("conclusion") == "success":
-                  recoveries += 1
+              readiness_step = find_step(steps, "Mark readiness degraded")
+              if readiness_step and readiness_step.get("conclusion") == "failure":
+                  readiness_incidents += 1
 
-              redis_step = find_step(steps, "Mark Redis degraded")
-              if redis_step and redis_step.get("conclusion") == "failure":
-                  redis_warnings += 1
+              recovery_degraded_step = find_step(steps, "Mark recovery degraded")
+              if recovery_degraded_step and recovery_degraded_step.get("conclusion") == "failure":
+                  partial_recoveries += 1
+
+              process_unavailable_step = find_step(steps, "Mark process unavailable")
+              if process_unavailable_step and process_unavailable_step.get("conclusion") == "failure":
+                  failed_recoveries += 1
+
+              if redeploy_step and redeploy_step.get("status") == "completed":
+                  if (
+                      smoke_step and smoke_step.get("status") == "completed"
+                      and recovery_degraded_step.get("conclusion") != "failure"
+                      and process_unavailable_step.get("conclusion") != "failure"
+                  ):
+                      full_recoveries += 1
 
               frontend_step = find_step(steps, "Frontend health check")
               if frontend_step and frontend_step.get("status") == "completed":
@@ -164,8 +179,10 @@ jobs:
               "keepalive_failed": keepalive_failed,
               "uptime": uptime,
               "redeploys": redeploys,
-              "recoveries": recoveries,
-              "redis_warnings": redis_warnings,
+              "full_recoveries": full_recoveries,
+              "partial_recoveries": partial_recoveries,
+              "failed_recoveries": failed_recoveries,
+              "readiness_incidents": readiness_incidents,
               "frontend_status": frontend_status,
               "backup_success": backup_success,
               "backup_failed": backup_failed,
@@ -282,8 +299,10 @@ jobs:
           KEEPALIVE_SUCCESS: ${{ steps.gha_metrics.outputs.keepalive_success }}
           UPTIME: ${{ steps.gha_metrics.outputs.uptime }}
           REDEPLOYS: ${{ steps.gha_metrics.outputs.redeploys }}
-          RECOVERIES: ${{ steps.gha_metrics.outputs.recoveries }}
-          REDIS_WARNINGS: ${{ steps.gha_metrics.outputs.redis_warnings }}
+          FULL_RECOVERIES: ${{ steps.gha_metrics.outputs.full_recoveries }}
+          PARTIAL_RECOVERIES: ${{ steps.gha_metrics.outputs.partial_recoveries }}
+          FAILED_RECOVERIES: ${{ steps.gha_metrics.outputs.failed_recoveries }}
+          READINESS_INCIDENTS: ${{ steps.gha_metrics.outputs.readiness_incidents }}
           FRONTEND_STATUS: ${{ steps.gha_metrics.outputs.frontend_status }}
           BACKUP_SUCCESS: ${{ steps.gha_metrics.outputs.backup_success }}
           BACKUP_FAILED: ${{ steps.gha_metrics.outputs.backup_failed }}
@@ -308,9 +327,12 @@ jobs:
                 ),
                 (
                     "Redeploys: "
-                    f"{os.environ['REDEPLOYS']} triggered, {os.environ['RECOVERIES']} recovered"
+                    f"{os.environ['REDEPLOYS']} triggered, "
+                    f"{os.environ['FULL_RECOVERIES']} fully recovered, "
+                    f"{os.environ['PARTIAL_RECOVERIES']} partial, "
+                    f"{os.environ['FAILED_RECOVERIES']} failed"
                 ),
-                f"Redis: {os.environ['REDIS_WARNINGS']} warning(s) detected",
+                f"Readiness incidents: {os.environ['READINESS_INCIDENTS']} detected",
                 f"Frontend: {os.environ['FRONTEND_STATUS']}",
                 (
                     "Backups: "
