@@ -33,35 +33,37 @@ jobs:
           fi
 
           body_file="$(mktemp)"
+          parser_file="$(mktemp)"
           status="no_response"
           redis="unknown"
           db="unknown"
           last_code="000"
 
+          cat > "$parser_file" <<'PY'
+          import json
+          import sys
+
+          result = {"redis": "unknown", "db": "unknown"}
+
+          try:
+              with open(sys.argv[1], "r", encoding="utf-8") as handle:
+                  payload = json.load(handle)
+          except Exception:
+              payload = {}
+
+          for key in ("redis", "db"):
+              value = payload.get(key, "missing")
+              if value is True:
+                  result[key] = "up"
+              elif value is False:
+                  result[key] = "down"
+
+          for key, value in result.items():
+              print(f"{key}={value}")
+          PY
+
           parse_dependencies() {
-            python3 - "$1" <<'PY'
-            import json
-            import sys
-
-            result = {"redis": "unknown", "db": "unknown"}
-            try:
-                with open(sys.argv[1], "r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-            except Exception:
-                for key, value in result.items():
-                    print(f"{key}={value}")
-                raise SystemExit(0)
-
-            for key in ("redis", "db"):
-                value = payload.get(key, "missing")
-                if value is True:
-                    result[key] = "up"
-                elif value is False:
-                    result[key] = "down"
-
-            for key, value in result.items():
-                print(f"{key}={value}")
-            PY
+            python3 "$parser_file" "$1"
           }
 
           for attempt in 1 2 3; do
@@ -98,6 +100,8 @@ jobs:
           echo "redis=$redis" >> "$GITHUB_OUTPUT"
           echo "db=$db" >> "$GITHUB_OUTPUT"
           echo "last_code=$last_code" >> "$GITHUB_OUTPUT"
+
+          rm -f "$body_file" "$parser_file"
 
       - name: Liveness check
         id: liveness_check
@@ -214,31 +218,33 @@ jobs:
           db="unknown"
           recovery="failed"
           ready_body="$(mktemp)"
+          parser_file="$(mktemp)"
+
+          cat > "$parser_file" <<'PY'
+          import json
+          import sys
+
+          result = {"redis": "unknown", "db": "unknown"}
+
+          try:
+              with open(sys.argv[1], "r", encoding="utf-8") as handle:
+                  payload = json.load(handle)
+          except Exception:
+              payload = {}
+
+          for key in ("redis", "db"):
+              value = payload.get(key, "missing")
+              if value is True:
+                  result[key] = "up"
+              elif value is False:
+                  result[key] = "down"
+
+          for key, value in result.items():
+              print(f"{key}={value}")
+          PY
 
           parse_dependencies() {
-            python3 - "$1" <<'PY'
-            import json
-            import sys
-
-            result = {"redis": "unknown", "db": "unknown"}
-            try:
-                with open(sys.argv[1], "r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-            except Exception:
-                for key, value in result.items():
-                    print(f"{key}={value}")
-                raise SystemExit(0)
-
-            for key in ("redis", "db"):
-                value = payload.get(key, "missing")
-                if value is True:
-                    result[key] = "up"
-                elif value is False:
-                    result[key] = "down"
-
-            for key, value in result.items():
-                print(f"{key}={value}")
-            PY
+            python3 "$parser_file" "$1"
           }
 
           echo "Waiting 90 seconds for Render cold start..."
@@ -281,7 +287,8 @@ jobs:
                 if [ "$code" = "503" ]; then
                   ready_status="dependency_failure"
                   recovery="partial"
-                  echo "::warning::Process recovered but readiness still failing. Redis: ${redis}. DB: ${db}."
+                  echo "::warning::Process recovered, but readiness still fails."
+                  echo "::warning::Redis: ${redis}. DB: ${db}."
                   break
                 fi
 
@@ -306,6 +313,8 @@ jobs:
           echo "redis=$redis" >> "$GITHUB_OUTPUT"
           echo "db=$db" >> "$GITHUB_OUTPUT"
           echo "recovery=$recovery" >> "$GITHUB_OUTPUT"
+
+          rm -f "$ready_body" "$parser_file"
 
       - name: Mark readiness degraded
         id: mark_readiness_degraded
@@ -400,7 +409,6 @@ jobs:
           import os
           import urllib.request
 
-
           def symbol(value: str) -> str:
               if value == "up":
                   return "✓"
@@ -408,13 +416,10 @@ jobs:
                   return "❌"
               return "?"
 
-
           def deps_summary(redis_value: str, db_value: str) -> str:
               return f"Redis: {symbol(redis_value)}, DB: {symbol(db_value)}"
 
-
           lines = ["Ops alert from keep-alive workflow:"]
-
           readiness_status = os.getenv("READINESS_STATUS", "")
           readiness_code = os.getenv("READINESS_CODE", "unknown")
           readiness_redis = os.getenv("READINESS_REDIS", "unknown")
@@ -445,9 +450,7 @@ jobs:
                   "API respondiendo pero no esta lista para atender requests. "
                   "No se redeploya. Revisar manualmente."
               )
-              lines.append(
-                  f"Liveness OK; readiness sin respuesta (healthz HTTP {liveness_code})."
-              )
+              lines.append(f"Liveness OK; readiness sin respuesta (healthz HTTP {liveness_code}).")
 
           if readiness_status == "no_response" and liveness_status == "down":
               lines.append("API caida (proceso no responde). Redeploy iniciado.")
@@ -463,9 +466,7 @@ jobs:
                   if redeploy_status == "failed":
                       lines.append(f"Deploy hook devolvio HTTP {redeploy_code}.")
                   elif smoke_health_status == "down":
-                      lines.append(
-                          f"Smoke healthz sin respuesta (ultimo HTTP {smoke_health_code})."
-                      )
+                      lines.append(f"Smoke healthz sin respuesta (ultimo HTTP {smoke_health_code}).")
                   elif smoke_ready_status == "unexpected_status":
                       lines.append(f"Smoke readyz devolvio HTTP {smoke_ready_code}.")
 

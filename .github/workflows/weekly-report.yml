@@ -220,28 +220,12 @@ jobs:
           storage_bytes="${storage_bytes:-0}"
 
           storage_pct="$(
-            python3 - <<'PY' "$storage_bytes"
-            import sys
-
-            value = int(sys.argv[1])
-            print(f"{(value / (10 * 1024 * 1024 * 1024)) * 100:.2f}")
-            PY
+            awk -v value="$storage_bytes" 'BEGIN {printf "%.2f", (value / (10 * 1024 * 1024 * 1024)) * 100}'
           )"
+          storage_human="$(numfmt --to=iec "$storage_bytes")"
 
           storage_summary="$(
-            python3 - <<'PY' "$storage_bytes" "$storage_pct"
-            import sys
-
-            value = int(sys.argv[1])
-            pct = sys.argv[2]
-            units = ["B", "KiB", "MiB", "GiB", "TiB"]
-            idx = 0
-            size = float(value)
-            while size >= 1024 and idx < len(units) - 1:
-                size /= 1024
-                idx += 1
-            print(f"{size:.1f} {units[idx]} / 10 GiB ({pct}%)")
-            PY
+            printf "%s / 10 GiB (%s%%)" "$storage_human" "$storage_pct"
           )"
 
           latest_backup="$(
@@ -259,27 +243,11 @@ jobs:
               --endpoint-url "$R2_ENDPOINT" >/dev/null
             db_size_bytes="$(gzip -l /tmp/latest_backup.dump.gz | awk 'NR==2 {print $2}')"
             db_pct="$(
-              python3 - <<'PY' "$db_size_bytes"
-              import sys
-
-              value = int(sys.argv[1])
-              print(f"{(value / (500 * 1024 * 1024)) * 100:.2f}")
-              PY
+              awk -v value="$db_size_bytes" 'BEGIN {printf "%.2f", (value / (500 * 1024 * 1024)) * 100}'
             )"
+            db_human="$(numfmt --to=iec "$db_size_bytes")"
             db_summary="$(
-              python3 - <<'PY' "$db_size_bytes" "$db_pct"
-              import sys
-
-              value = int(sys.argv[1])
-              pct = sys.argv[2]
-              units = ["B", "KiB", "MiB", "GiB", "TiB"]
-              idx = 0
-              size = float(value)
-              while size >= 1024 and idx < len(units) - 1:
-                  size /= 1024
-                  idx += 1
-              print(f"{size:.1f} {units[idx]} / 500 MiB ({pct}%)")
-              PY
+              printf "%s / 500 MiB (%s%%)" "$db_human" "$db_pct"
             )"
             rm -f /tmp/latest_backup.dump.gz
           fi
@@ -313,8 +281,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          report="$(
-            python3 <<'PY'
+          report_file="$(mktemp)"
+
+          python3 > "$report_file" <<'PY'
             import os
 
             lines = [
@@ -347,8 +316,10 @@ jobs:
             ]
 
             print("\n".join(lines))
-            PY
-          )"
+          PY
+
+          report="$(cat "$report_file")"
+          rm -f "$report_file"
 
           {
             echo "report<<EOF"
