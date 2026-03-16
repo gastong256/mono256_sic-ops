@@ -35,6 +35,8 @@ jobs:
           body_file="$(mktemp)"
           parser_file="$(mktemp)"
           status="no_response"
+          app_status="unknown"
+          fallback="unknown"
           redis="unknown"
           db="unknown"
           last_code="000"
@@ -43,7 +45,12 @@ jobs:
           import json
           import sys
 
-          result = {"redis": "unknown", "db": "unknown"}
+          result = {
+              "app_status": "unknown",
+              "fallback": "unknown",
+              "redis": "unknown",
+              "db": "unknown",
+          }
 
           try:
               with open(sys.argv[1], "r", encoding="utf-8") as handle:
@@ -57,6 +64,16 @@ jobs:
                   result[key] = "up"
               elif value is False:
                   result[key] = "down"
+
+          raw_status = payload.get("status", "missing")
+          if isinstance(raw_status, str):
+              result["app_status"] = raw_status
+
+          raw_fallback = payload.get("fallback", "missing")
+          if raw_fallback is True:
+              result["fallback"] = "true"
+          elif raw_fallback is False:
+              result["fallback"] = "false"
 
           for key, value in result.items():
               print(f"{key}={value}")
@@ -73,19 +90,31 @@ jobs:
               eval "$(parse_dependencies "$body_file")"
 
               if [ "$code" = "200" ]; then
-                status="ready"
-                echo "API is ready. Redis: ${redis}. DB: ${db}."
+                if [ "$db" = "up" ] && [ "$redis" = "up" ]; then
+                  status="ready"
+                  echo "API is healthy. Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
+                elif [ "$db" = "up" ] && [ "$redis" = "down" ] && [ "$fallback" = "true" ]; then
+                  status="degraded_fallback"
+                  echo "::warning::API is operating in degraded fallback mode."
+                  echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
+                else
+                  status="unexpected_status"
+                  echo "::warning::Readiness returned HTTP 200 with an unexpected payload."
+                  echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
+                fi
                 break
               fi
 
               if [ "$code" = "503" ]; then
                 status="dependency_failure"
-                echo "::warning::API is alive but not ready. Redis: ${redis}. DB: ${db}."
+                echo "::warning::API is alive but not ready."
+                echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
                 break
               fi
 
               status="unexpected_status"
-              echo "::warning::Readiness endpoint returned unexpected HTTP ${code}. Redis: ${redis}. DB: ${db}."
+              echo "::warning::Readiness endpoint returned unexpected HTTP ${code}."
+              echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
               break
             fi
 
@@ -97,6 +126,8 @@ jobs:
           done
 
           echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "app_status=$app_status" >> "$GITHUB_OUTPUT"
+          echo "fallback=$fallback" >> "$GITHUB_OUTPUT"
           echo "redis=$redis" >> "$GITHUB_OUTPUT"
           echo "db=$db" >> "$GITHUB_OUTPUT"
           echo "last_code=$last_code" >> "$GITHUB_OUTPUT"
@@ -214,6 +245,8 @@ jobs:
           health_code="000"
           ready_status="not_checked"
           ready_code="000"
+          app_status="unknown"
+          fallback="unknown"
           redis="unknown"
           db="unknown"
           recovery="failed"
@@ -224,7 +257,12 @@ jobs:
           import json
           import sys
 
-          result = {"redis": "unknown", "db": "unknown"}
+          result = {
+              "app_status": "unknown",
+              "fallback": "unknown",
+              "redis": "unknown",
+              "db": "unknown",
+          }
 
           try:
               with open(sys.argv[1], "r", encoding="utf-8") as handle:
@@ -238,6 +276,16 @@ jobs:
                   result[key] = "up"
               elif value is False:
                   result[key] = "down"
+
+          raw_status = payload.get("status", "missing")
+          if isinstance(raw_status, str):
+              result["app_status"] = raw_status
+
+          raw_fallback = payload.get("fallback", "missing")
+          if raw_fallback is True:
+              result["fallback"] = "true"
+          elif raw_fallback is False:
+              result["fallback"] = "false"
 
           for key, value in result.items():
               print(f"{key}={value}")
@@ -278,9 +326,21 @@ jobs:
                 eval "$(parse_dependencies "$ready_body")"
 
                 if [ "$code" = "200" ]; then
-                  ready_status="ready"
-                  recovery="complete"
-                  echo "Recovery complete. Redis: ${redis}. DB: ${db}."
+                  if [ "$db" = "up" ] && [ "$redis" = "up" ]; then
+                    ready_status="ready"
+                    recovery="complete"
+                    echo "Recovery complete. Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
+                  elif [ "$db" = "up" ] && [ "$redis" = "down" ] && [ "$fallback" = "true" ]; then
+                    ready_status="degraded_fallback"
+                    recovery="degraded"
+                    echo "::warning::Process recovered in degraded fallback mode."
+                    echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
+                  else
+                    ready_status="unexpected_status"
+                    recovery="partial"
+                    echo "::warning::Readyz returned HTTP 200 with an unexpected payload after redeploy."
+                    echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
+                  fi
                   break
                 fi
 
@@ -288,13 +348,14 @@ jobs:
                   ready_status="dependency_failure"
                   recovery="partial"
                   echo "::warning::Process recovered, but readiness still fails."
-                  echo "::warning::Redis: ${redis}. DB: ${db}."
+                  echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
                   break
                 fi
 
                 ready_status="unexpected_status"
                 recovery="partial"
-                echo "::warning::Readyz returned unexpected HTTP ${code} after redeploy. Redis: ${redis}. DB: ${db}."
+                echo "::warning::Readyz returned unexpected HTTP ${code} after redeploy."
+                echo "::warning::Status: ${app_status}. Redis: ${redis}. DB: ${db}. Fallback: ${fallback}."
                 break
               fi
 
@@ -310,11 +371,22 @@ jobs:
           echo "health_code=$health_code" >> "$GITHUB_OUTPUT"
           echo "ready_status=$ready_status" >> "$GITHUB_OUTPUT"
           echo "ready_code=$ready_code" >> "$GITHUB_OUTPUT"
+          echo "app_status=$app_status" >> "$GITHUB_OUTPUT"
+          echo "fallback=$fallback" >> "$GITHUB_OUTPUT"
           echo "redis=$redis" >> "$GITHUB_OUTPUT"
           echo "db=$db" >> "$GITHUB_OUTPUT"
           echo "recovery=$recovery" >> "$GITHUB_OUTPUT"
 
           rm -f "$ready_body" "$parser_file"
+
+      - name: Mark fallback degraded
+        id: mark_fallback_degraded
+        if: ${{ steps.readiness_check.outputs.status == 'degraded_fallback' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "::warning::API is serving traffic in degraded fallback mode."
+          exit 1
 
       - name: Mark readiness degraded
         id: mark_readiness_degraded
@@ -351,6 +423,15 @@ jobs:
           echo "::warning::Django process recovered but dependencies are still failing."
           exit 1
 
+      - name: Mark recovery fallback degraded
+        id: mark_recovery_fallback_degraded
+        if: ${{ steps.smoke.outputs.recovery == 'degraded' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "::warning::Django process recovered in degraded fallback mode."
+          exit 1
+
       - name: Mark process unavailable
         id: mark_process_unavailable
         if: >-
@@ -375,8 +456,10 @@ jobs:
             env.DISCORD_WEBHOOK_URL != '' &&
             (
               steps.mark_readiness_degraded.outcome == 'failure' ||
+              steps.mark_fallback_degraded.outcome == 'failure' ||
               steps.mark_frontend_degraded.outcome == 'failure' ||
               steps.mark_recovery_degraded.outcome == 'failure' ||
+              steps.mark_recovery_fallback_degraded.outcome == 'failure' ||
               steps.mark_process_unavailable.outcome == 'failure' ||
               steps.redeploy.outputs.status == 'success'
             )
@@ -386,6 +469,8 @@ jobs:
           LIVENESS_CODE: ${{ steps.liveness_check.outputs.last_code }}
           LIVENESS_STATUS: ${{ steps.liveness_check.outputs.status }}
           READINESS_CODE: ${{ steps.readiness_check.outputs.last_code }}
+          READINESS_FALLBACK: ${{ steps.readiness_check.outputs.fallback }}
+          READINESS_APP_STATUS: ${{ steps.readiness_check.outputs.app_status }}
           READINESS_DB: ${{ steps.readiness_check.outputs.db }}
           READINESS_REDIS: ${{ steps.readiness_check.outputs.redis }}
           READINESS_STATUS: ${{ steps.readiness_check.outputs.status }}
@@ -394,8 +479,10 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           SMOKE_DB: ${{ steps.smoke.outputs.db }}
+          SMOKE_FALLBACK: ${{ steps.smoke.outputs.fallback }}
           SMOKE_HEALTH_CODE: ${{ steps.smoke.outputs.health_code }}
           SMOKE_HEALTH_STATUS: ${{ steps.smoke.outputs.health_status }}
+          SMOKE_APP_STATUS: ${{ steps.smoke.outputs.app_status }}
           SMOKE_READY_CODE: ${{ steps.smoke.outputs.ready_code }}
           SMOKE_READY_STATUS: ${{ steps.smoke.outputs.ready_status }}
           SMOKE_RECOVERY: ${{ steps.smoke.outputs.recovery }}
@@ -421,7 +508,9 @@ jobs:
 
           lines = ["Ops alert from keep-alive workflow:"]
           readiness_status = os.getenv("READINESS_STATUS", "")
+          readiness_app_status = os.getenv("READINESS_APP_STATUS", "unknown")
           readiness_code = os.getenv("READINESS_CODE", "unknown")
+          readiness_fallback = os.getenv("READINESS_FALLBACK", "unknown")
           readiness_redis = os.getenv("READINESS_REDIS", "unknown")
           readiness_db = os.getenv("READINESS_DB", "unknown")
           liveness_status = os.getenv("LIVENESS_STATUS", "")
@@ -431,17 +520,30 @@ jobs:
           smoke_recovery = os.getenv("SMOKE_RECOVERY", "")
           smoke_health_status = os.getenv("SMOKE_HEALTH_STATUS", "")
           smoke_health_code = os.getenv("SMOKE_HEALTH_CODE", "unknown")
+          smoke_app_status = os.getenv("SMOKE_APP_STATUS", "unknown")
           smoke_ready_status = os.getenv("SMOKE_READY_STATUS", "")
           smoke_ready_code = os.getenv("SMOKE_READY_CODE", "unknown")
+          smoke_fallback = os.getenv("SMOKE_FALLBACK", "unknown")
           smoke_redis = os.getenv("SMOKE_REDIS", "unknown")
           smoke_db = os.getenv("SMOKE_DB", "unknown")
           frontend_status = os.getenv("FRONTEND_STATUS", "")
 
-          if readiness_status in {"dependency_failure", "unexpected_status"}:
+          if readiness_status == "degraded_fallback":
+              lines.append(
+                  "API operativa en modo degradado por fallback de Redis "
+                  f"({deps_summary(readiness_redis, readiness_db)}). No se redeploya."
+              )
+              lines.append(
+                  f"Readyz status: {readiness_app_status}. Fallback: {readiness_fallback}."
+              )
+          elif readiness_status in {"dependency_failure", "unexpected_status"}:
               lines.append(
                   "API respondiendo pero dependencias caidas "
                   f"({deps_summary(readiness_redis, readiness_db)}). "
                   "No se redeploya. Revisar manualmente."
+              )
+              lines.append(
+                  f"Readyz status: {readiness_app_status}. Fallback: {readiness_fallback}."
               )
               if readiness_status == "unexpected_status":
                   lines.append(f"Readiness devolvio HTTP {readiness_code}.")
@@ -456,6 +558,14 @@ jobs:
               lines.append("API caida (proceso no responde). Redeploy iniciado.")
               if redeploy_status == "success" and smoke_recovery == "complete":
                   lines.append("API caida. Redeploy completado. Recovery exitosa.")
+              elif redeploy_status == "success" and smoke_recovery == "degraded":
+                  lines.append(
+                      "API caida. Redeploy completado y la app volvio en modo degradado "
+                      f"por fallback ({deps_summary(smoke_redis, smoke_db)})."
+                  )
+                  lines.append(
+                      f"Smoke readyz status: {smoke_app_status}. Fallback: {smoke_fallback}."
+                  )
               elif redeploy_status == "success" and smoke_recovery == "partial":
                   lines.append(
                       "API caida. Redeploy completado pero dependencias siguen fallando "
@@ -502,6 +612,12 @@ jobs:
              [ "${{ steps.mark_process_unavailable.outcome }}" = "failure" ]; then
             echo "::error::One or more monitored components need attention."
             exit 1
+          fi
+
+          if [ "${{ steps.mark_fallback_degraded.outcome }}" = "failure" ] || \
+             [ "${{ steps.mark_recovery_fallback_degraded.outcome }}" = "failure" ]; then
+            echo "::warning::API is operational in degraded fallback mode."
+            exit 0
           fi
 
           echo "All monitored components are healthy."

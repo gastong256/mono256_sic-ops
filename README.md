@@ -69,14 +69,39 @@ Notification routing:
 `keep-alive.yml` now uses two endpoints:
 
 - `/healthz`: liveness only. It should return HTTP `200` when the Django process is alive.
-- `/readyz`: readiness. It should return HTTP `200` when the service can actually serve traffic, and `503` when a dependency is unavailable.
+- `/readyz`: readiness. It should return HTTP `200` when the service can actually serve traffic, `200` with a degraded payload when Redis fallback is active, and `503` when a hard dependency is unavailable.
 
-The readiness body should look like this:
+The readiness body should use boolean `redis` and `db` keys, plus a string `status`
+and boolean `fallback`. Healthy example:
 
 ```json
 {
+  "status": "ok",
+  "fallback": false,
   "redis": true,
   "db": true
+}
+```
+
+Accepted degraded example when the app is still serving traffic without Redis:
+
+```json
+{
+  "status": "degraded",
+  "fallback": true,
+  "redis": false,
+  "db": true
+}
+```
+
+Hard failure example:
+
+```json
+{
+  "status": "unavailable",
+  "fallback": false,
+  "redis": true,
+  "db": false
 }
 ```
 
@@ -87,11 +112,12 @@ The readiness body should look like this:
 `keep-alive.yml` follows this sequence:
 
 1. Call `/readyz` first.
-2. If `/readyz` returns `200`, the API, Redis, and DB are healthy.
-3. If `/readyz` returns `503`, the Django process is alive but one or more dependencies are down. The workflow alerts, but does not redeploy.
-4. If `/readyz` does not respond, call `/healthz`.
-5. If `/healthz` returns `200`, the Django process is alive but not ready. The workflow alerts, but does not redeploy.
-6. Only if `/healthz` also fails does the workflow trigger the Render deploy hook.
+2. If `/readyz` returns `200` with `redis=true` and `db=true`, the API is healthy.
+3. If `/readyz` returns `200` with `db=true`, `redis=false`, and `fallback=true`, the API is considered degraded but still available. The workflow alerts, does not redeploy, and the run stays successful so uptime is not penalized.
+4. If `/readyz` returns `503`, the Django process is alive but one or more hard dependencies are down. The workflow alerts, but does not redeploy.
+5. If `/readyz` does not respond, call `/healthz`.
+6. If `/healthz` returns `200`, the Django process is alive but not ready. The workflow alerts, but does not redeploy.
+7. Only if `/healthz` also fails does the workflow trigger the Render deploy hook.
 
 This is intentional: redeploying does not fix Redis or Supabase outages, so the
 workflow only redeploys when the Django process itself is dead.
@@ -102,7 +128,9 @@ After a redeploy the workflow waits 90 seconds, then:
 
 1. Checks `/healthz` to confirm the process started.
 2. If the process is up, checks `/readyz` to confirm Redis and DB recovered.
-3. Reports one of three states: full recovery, process recovered but dependencies still failing, or recovery failed.
+3. Reports one of four states: full recovery, degraded fallback recovery, process recovered but dependencies still failing, or recovery failed.
+
+The weekly report tracks degraded fallback checks separately from hard readiness incidents so Redis fallback does not count as downtime.
 
 ## Restore a Backup
 

@@ -110,8 +110,10 @@ jobs:
 
           redeploys = 0
           full_recoveries = 0
+          degraded_recoveries = 0
           partial_recoveries = 0
           failed_recoveries = 0
+          fallback_degradations = 0
           readiness_incidents = 0
           frontend_checks = 0
           frontend_failures = 0
@@ -124,10 +126,18 @@ jobs:
                   if redeploy_step.get("conclusion") in {"success", "failure"}:
                       redeploys += 1
 
+              fallback_degraded_step = find_step(steps, "Mark fallback degraded")
+              if fallback_degraded_step and fallback_degraded_step.get("conclusion") == "failure":
+                  fallback_degradations += 1
+
               smoke_step = find_step(steps, "Smoke test after redeploy")
               readiness_step = find_step(steps, "Mark readiness degraded")
               if readiness_step and readiness_step.get("conclusion") == "failure":
                   readiness_incidents += 1
+
+              recovery_fallback_step = find_step(steps, "Mark recovery fallback degraded")
+              if recovery_fallback_step and recovery_fallback_step.get("conclusion") == "failure":
+                  degraded_recoveries += 1
 
               recovery_degraded_step = find_step(steps, "Mark recovery degraded")
               if recovery_degraded_step and recovery_degraded_step.get("conclusion") == "failure":
@@ -140,6 +150,7 @@ jobs:
               if redeploy_step and redeploy_step.get("status") == "completed":
                   if (
                       smoke_step and smoke_step.get("status") == "completed"
+                      and recovery_fallback_step.get("conclusion") != "failure"
                       and recovery_degraded_step.get("conclusion") != "failure"
                       and process_unavailable_step.get("conclusion") != "failure"
                   ):
@@ -180,8 +191,10 @@ jobs:
               "uptime": uptime,
               "redeploys": redeploys,
               "full_recoveries": full_recoveries,
+              "degraded_recoveries": degraded_recoveries,
               "partial_recoveries": partial_recoveries,
               "failed_recoveries": failed_recoveries,
+              "fallback_degradations": fallback_degradations,
               "readiness_incidents": readiness_incidents,
               "frontend_status": frontend_status,
               "backup_success": backup_success,
@@ -268,8 +281,10 @@ jobs:
           UPTIME: ${{ steps.gha_metrics.outputs.uptime }}
           REDEPLOYS: ${{ steps.gha_metrics.outputs.redeploys }}
           FULL_RECOVERIES: ${{ steps.gha_metrics.outputs.full_recoveries }}
+          DEGRADED_RECOVERIES: ${{ steps.gha_metrics.outputs.degraded_recoveries }}
           PARTIAL_RECOVERIES: ${{ steps.gha_metrics.outputs.partial_recoveries }}
           FAILED_RECOVERIES: ${{ steps.gha_metrics.outputs.failed_recoveries }}
+          FALLBACK_DEGRADATIONS: ${{ steps.gha_metrics.outputs.fallback_degradations }}
           READINESS_INCIDENTS: ${{ steps.gha_metrics.outputs.readiness_incidents }}
           FRONTEND_STATUS: ${{ steps.gha_metrics.outputs.frontend_status }}
           BACKUP_SUCCESS: ${{ steps.gha_metrics.outputs.backup_success }}
@@ -284,38 +299,43 @@ jobs:
           report_file="$(mktemp)"
 
           python3 > "$report_file" <<'PY'
-            import os
+          import os
 
-            lines = [
-                f"Weekly Ops Report ({os.environ['RANGE_START']} to {os.environ['RANGE_END']})",
-                "",
-                (
-                    "API Uptime: "
-                    f"{os.environ['UPTIME']}% "
-                    f"({os.environ['KEEPALIVE_SUCCESS']}/{os.environ['KEEPALIVE_TOTAL']} checks OK)"
-                ),
-                (
-                    "Redeploys: "
-                    f"{os.environ['REDEPLOYS']} triggered, "
-                    f"{os.environ['FULL_RECOVERIES']} fully recovered, "
-                    f"{os.environ['PARTIAL_RECOVERIES']} partial, "
-                    f"{os.environ['FAILED_RECOVERIES']} failed"
-                ),
-                f"Readiness incidents: {os.environ['READINESS_INCIDENTS']} detected",
-                f"Frontend: {os.environ['FRONTEND_STATUS']}",
-                (
-                    "Backups: "
-                    f"{os.environ['BACKUP_SUCCESS']} successful, "
-                    f"{os.environ['BACKUP_FAILED']} failed"
-                ),
-                (
-                    "R2 Storage: "
-                    f"{os.environ['STORAGE_SUMMARY']} across {os.environ['BACKUP_COUNT']} object(s)"
-                ),
-                f"DB Size: {os.environ['DB_SUMMARY']}",
-            ]
+          lines = [
+              f"Weekly Ops Report ({os.environ['RANGE_START']} to {os.environ['RANGE_END']})",
+              "",
+              (
+                  "API Uptime: "
+                  f"{os.environ['UPTIME']}% "
+                  f"({os.environ['KEEPALIVE_SUCCESS']}/{os.environ['KEEPALIVE_TOTAL']} checks OK)"
+              ),
+              (
+                  "Redeploys: "
+                  f"{os.environ['REDEPLOYS']} triggered, "
+                  f"{os.environ['FULL_RECOVERIES']} fully recovered, "
+                  f"{os.environ['DEGRADED_RECOVERIES']} degraded fallback, "
+                  f"{os.environ['PARTIAL_RECOVERIES']} partial, "
+                  f"{os.environ['FAILED_RECOVERIES']} failed"
+              ),
+              (
+                  "Fallback degradations: "
+                  f"{os.environ['FALLBACK_DEGRADATIONS']} detected"
+              ),
+              f"Hard readiness incidents: {os.environ['READINESS_INCIDENTS']} detected",
+              f"Frontend: {os.environ['FRONTEND_STATUS']}",
+              (
+                  "Backups: "
+                  f"{os.environ['BACKUP_SUCCESS']} successful, "
+                  f"{os.environ['BACKUP_FAILED']} failed"
+              ),
+              (
+                  "R2 Storage: "
+                  f"{os.environ['STORAGE_SUMMARY']} across {os.environ['BACKUP_COUNT']} object(s)"
+              ),
+              f"DB Size: {os.environ['DB_SUMMARY']}",
+          ]
 
-            print("\n".join(lines))
+          print("\n".join(lines))
           PY
 
           report="$(cat "$report_file")"
