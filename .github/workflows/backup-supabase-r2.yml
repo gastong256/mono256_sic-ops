@@ -65,6 +65,7 @@ jobs:
             -d postgres \
             --no-owner \
             --no-privileges \
+            --schema=public \
             -F c \
             -f "$dump_file"
 

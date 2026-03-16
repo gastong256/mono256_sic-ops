@@ -22,7 +22,7 @@ All credentials live in GitHub Actions secrets. No secrets belong in code.
 | Workflow | Schedule | Version | Description |
 |---|---|---|---|
 | `keep-alive.yml` | `*/5 * * * *` | v1 + v2 | Checks `/readyz` first, falls back to `/healthz` if needed, only redeploys when the Django process is actually down, and runs a two-step smoke test after recovery |
-| `backup-supabase-r2.yml` | `0 3 * * *` | v1 + v3 | Creates a daily compressed `pg_dump`, uploads it to R2, verifies integrity, tracks DB and R2 usage, and removes backups older than 7 days |
+| `backup-supabase-r2.yml` | `0 3 * * *` | v1 + v3 | Creates a daily compressed `pg_dump` of the `public` schema, uploads it to R2, verifies integrity, tracks DB and R2 usage, and removes backups older than 7 days |
 | `secret-scan.yml` | `push`, `pull_request` | v1 | Runs `detect-secrets` against the repository and fails when new secrets appear outside the baseline |
 | `weekly-report.yml` | `0 9 * * 1` | v2 | Aggregates the previous 7 days of liveness, readiness, redeploy, recovery, backup, and storage metrics into a weekly ops summary |
 | `supabase-keepalive.yml` | `0 */12 * * *` | v4 | Executes a direct `SELECT 1` against Supabase every 12 hours to avoid idle project pausing |
@@ -148,6 +148,10 @@ pg_restore \
 
 If you are restoring into a disposable or empty database and want a clean reset,
 add `--clean --if-exists`.
+
+This repository backs up the `public` schema only. That keeps the dump portable
+across regular PostgreSQL instances and avoids requiring elevated access to
+Supabase-managed schemas like `auth`, `storage`, and `realtime`.
 
 ## Security
 
